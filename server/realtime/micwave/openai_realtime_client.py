@@ -32,13 +32,17 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
     ) -> dict:
         effective_modalities = modalities or ["text"]
         return {
-            "modalities": effective_modalities,
-            "input_audio_format": "pcm16",
-            "input_audio_transcription": {
-                "model": "gpt-4o-transcribe"
+            "type": "realtime",
+            "output_modalities": effective_modalities,
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "transcription": {
+                        "model": "gpt-4o-transcribe",
+                    },
+                    "turn_detection": None,
+                },
             },
-            # Disable server-side VAD; rely on manual buffering/commits.
-            "turn_detection": None,
             "instructions": instructions or get_realtime_prompt(),
         }
         
@@ -50,7 +54,6 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
         """Connect to OpenAI's realtime API and configure the session"""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "OpenAI-Beta": "realtime=v1",
         }
 
         # Support both websockets param names across versions: extra_headers (older) and additional_headers (newer)
@@ -233,8 +236,7 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
         """Start a new response with given instructions"""
         if self._is_ws_open():
             response_config = {
-                "modalities": ["text"],
-                "temperature": 0.6,  # OpenAI Realtime API 最小值是 0.6
+                "output_modalities": ["text"],
             }
             if self.include_instructions_each_response and instructions:
                 response_config["instructions"] = instructions
@@ -244,7 +246,7 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
                 "response": response_config
             }))
             logger.info(
-                "Started response with temperature=0.6"
+                "Started response (text-only)"
                 + (
                     " (with per-response instructions)"
                     if self.include_instructions_each_response

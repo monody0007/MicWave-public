@@ -18,6 +18,7 @@ from config import (
     XAI_REALTIME_MODALITIES,
     REALTIME_PROVIDER,
 )
+from audio_persistence import TurnAudioCache
 from openai_realtime_client import OpenAIRealtimeAudioTextClient
 from prompts import get_optimize_prompt
 from realtime_client_base import RealtimeClientBase
@@ -163,6 +164,7 @@ async def websocket_endpoint(websocket: WebSocket):
     TRANSCRIPTION_FAILURE_ROTATE_THRESHOLD = 2
     passthrough_without_marker = os.getenv("BRAINWAVE_PASSTHROUGH_WITHOUT_MARKER", "0") == "1"
     homonym_corrector = StreamingHomonymCorrector()
+    audio_cache = TurnAudioCache.from_env()
 
     def normalize_turn_id(raw_turn_id) -> Optional[int]:
         if raw_turn_id is None:
@@ -250,6 +252,14 @@ async def websocket_endpoint(websocket: WebSocket):
         pending_audio_chunks.clear()
         recording_stopped.set()
         try:
+            audio_cache.enqueue_turn(
+                turn_id=active_turn_id,
+                outcome=reason,
+                sample_rate=audio_processor.target_sample_rate,
+            )
+        except Exception as e:
+            logger.error(f"Error enqueueing audio cache on finalize ({reason}): {e}", exc_info=True)
+        try:
             await flush_homonym_corrector()
         except Exception as e:
             logger.error(f"Error flushing homonym corrector on finalize ({reason}): {e}", exc_info=True)
@@ -269,6 +279,7 @@ async def websocket_endpoint(websocket: WebSocket):
         can_keep_session = keep_provider_session and reason in {
             "response.done",
             "response.text.done",
+            "response.output_text.done",
             "response.output_audio_transcript.done",
         }
         if can_keep_session:
@@ -475,11 +486,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 client.register_handler("conversation.item.created", lambda data: handle_generic_event("conversation.item.created", data))
                 client.register_handler("response.content_part.added", lambda data: handle_generic_event("response.content_part.added", data))
                 client.register_handler("response.text.done", lambda data: handle_response_text_done(data))
+                client.register_handler("response.output_text.done", lambda data: handle_response_text_done(data))
                 client.register_handler("response.content_part.done", lambda data: handle_generic_event("response.content_part.done", data))
                 client.register_handler("response.output_item.done", lambda data: handle_generic_event("response.output_item.done", data))
                 client.register_handler("response.done", lambda data: handle_response_done(data))
                 client.register_handler("error", lambda data: handle_error(data))
                 client.register_handler("response.text.delta", lambda data: handle_text_delta(data))
+                client.register_handler("response.output_text.delta", lambda data: handle_text_delta(data))
                 # x.ai uses response.output_audio_transcript.delta instead of response.text.delta
                 client.register_handler("response.output_audio_transcript.delta", lambda data: handle_text_delta(data))
                 client.register_handler("response.created", lambda data: handle_response_created(data))
@@ -846,6 +859,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 if "bytes" in data:
                     processed_audio = audio_processor.process_audio_chunk(data["bytes"])
+                    if is_recording:
+                        audio_cache.accumulate(processed_audio)
                     if not openai_ready.is_set():
                         logger.debug("Provider not ready, buffering audio chunk")
                         pending_audio_chunks.append(processed_audio)
@@ -935,7 +950,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             reset_payload["turn_id"] = active_turn_id
                         await websocket.send_text(json.dumps(reset_payload, ensure_ascii=False))
                         is_recording = True
-                        
+                        audio_cache.start_turn(active_turn_id)
+
                         # Send any buffered chunks
                         if pending_audio_chunks and client:
                             logger.info(f"Sending {len(pending_audio_chunks)} buffered chunks")
@@ -1026,6 +1042,10 @@ async def websocket_endpoint(websocket: WebSocket):
         
         if client:
             await client.close()
+        try:
+            audio_cache.close()
+        except Exception as e:
+            logger.warning(f"Ignoring error closing audio_cache: {e}")
         if websocket.client_state != WebSocketState.DISCONNECTED:
             try:
                 await websocket.close()
