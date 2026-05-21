@@ -126,9 +126,9 @@ class Config:
     hotkey_keycode: int = 50  # ` 键的 keycode
     provider: str = "openai"
     model: str = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini-2025-12-15")
-    stop_tail_wait_min_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MIN_MS", "260"))
-    stop_tail_wait_max_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MAX_MS", "400"))
-    stop_tail_wait_guard_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_GUARD_MS", "30"))
+    stop_tail_wait_min_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MIN_MS", "70"))
+    stop_tail_wait_max_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MAX_MS", "150"))
+    stop_tail_wait_guard_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_GUARD_MS", "20"))
     idle_ws_reconnect_sec: int = int(
         os.getenv(
             "BRAINWAVE_IDLE_WS_RECONNECT_SEC",
