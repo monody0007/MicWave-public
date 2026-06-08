@@ -123,6 +123,11 @@ class RealtimeClientBase(ABC):
                 pass
         # If neither attribute is reliable, assume open if object exists
         return True
+
+    def _require_ws_open(self):
+        """Raise ConnectionError if WebSocket is not open. Call at top of turn-boundary send methods."""
+        if not self._is_ws_open():
+            raise ConnectionError("WebSocket is not open")
     
     async def default_handler(self, data: dict):
         """

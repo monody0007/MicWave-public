@@ -6,6 +6,7 @@ Brainwave IME - macOS 菜单栏应用
 """
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import queue
@@ -87,8 +88,11 @@ except Exception:
     NSTextAlignmentLeft = None
 
 PROJECT_DIR = os.path.abspath(os.path.dirname(__file__))
+PID_DIR = os.path.expanduser("~/Library/Application Support/Brainwave IME")
+SERVER_PID_FILE = os.path.join(PID_DIR, "server.pid")
 PASTEBOARD_TEXT_TYPE = "public.utf8-plain-text"
 KEYCODE_V = 9
+_AUDIO_QUEUE_MAXSIZE = 50
 
 def _accessibility_is_trusted(prompt: bool = False) -> Optional[bool]:
     if not HAS_AX_TRUST:
@@ -126,9 +130,10 @@ class Config:
     hotkey_keycode: int = 50  # ` 键的 keycode
     provider: str = "openai"
     model: str = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini-2025-12-15")
-    stop_tail_wait_min_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MIN_MS", "70"))
+    stop_tail_wait_min_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MIN_MS", "150"))
     stop_tail_wait_max_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MAX_MS", "150"))
     stop_tail_wait_guard_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_GUARD_MS", "20"))
+    processing_timeout_sec: int = int(os.getenv("BRAINWAVE_PROCESSING_TIMEOUT_SEC", "30"))
     idle_ws_reconnect_sec: int = int(
         os.getenv(
             "BRAINWAVE_IDLE_WS_RECONNECT_SEC",
@@ -183,6 +188,15 @@ class BrainwaveIMECore:
         self.audio_stream = None
         self.audio_buffer = []
         self._audio_buffer_samples = 0
+        self._pyaudio_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="pyaudio",
+        )
+        self._audio_queue: Optional[asyncio.Queue] = None
+        self._audio_consumer_task: Optional[asyncio.Task] = None
+        self._audio_drained: asyncio.Event = asyncio.Event()
+        self._audio_consumer_paused: bool = True
+        self._audio_drop_count: int = 0
         self.ws = None
         self.ws_connected = False
         self.hotkey_active = False
@@ -205,7 +219,9 @@ class BrainwaveIMECore:
         self._recording_started_ts = None
         self._stop_pressed_ts = None
         self._response_done_ts = None
+        self._processing_entered_ts = None
         self._last_audio_callback_ts = None
+        self._current_stream_turn_id = None
         if self.config.upload_chunk_ms <= 0 or self.config.chunk_size <= 0:
             preset_defaults = {
                 "balanced": (160, 3840),
@@ -298,18 +314,42 @@ class BrainwaveIMECore:
         self._session_started = False
         self._ws_connected_wall_ts = None
 
-    def _close_audio_stream(self):
-        if not self.audio_stream:
+    def _close_audio_stream_sync(self):
+        stream = self.audio_stream
+        self.audio_stream = None
+        self._close_audio_stream_blocking(stream)
+
+    def _close_audio_stream_blocking(self, stream):
+        if not stream:
             return
         try:
-            self.audio_stream.stop_stream()
+            stream.stop_stream()
         except Exception:
             pass
         try:
-            self.audio_stream.close()
+            stream.close()
         except Exception:
             pass
+
+    async def _close_audio_stream(self):
+        stream = self.audio_stream
         self.audio_stream = None
+        if not stream:
+            return
+        loop = self.loop or asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self._pyaudio_executor,
+            self._close_audio_stream_blocking,
+            stream,
+        )
+
+    def _ensure_audio_pipeline(self):
+        if self._audio_queue is None:
+            self._audio_queue = asyncio.Queue(maxsize=_AUDIO_QUEUE_MAXSIZE)
+        if self._audio_consumer_task is None or self._audio_consumer_task.done():
+            self._audio_consumer_task = asyncio.create_task(
+                self._audio_consumer_loop()
+            )
 
     def _trim_local_audio(self):
         overflow = len(self._local_turn_audio) - self._max_local_audio_bytes
@@ -479,13 +519,10 @@ class BrainwaveIMECore:
             print(f"[IME] Failed to prune recent audio cache: {exc}")
 
     def _start_session_task(self):
-        if not self.loop:
-            return
         if self._session_task and not self._session_task.done():
             return
-        self._session_task = asyncio.run_coroutine_threadsafe(
-            self._ensure_session_started(self._session_prompt_mode),
-            self.loop
+        self._session_task = asyncio.create_task(
+            self._ensure_session_started(self._session_prompt_mode)
         )
 
     def _clear_audio_buffer(self):
@@ -514,11 +551,14 @@ class BrainwaveIMECore:
         if self.state != new_state:
             old_state = self.state
             self.state = new_state
+            if new_state == IMEState.PROCESSING:
+                self._processing_entered_ts = time.perf_counter()
+            else:
+                self._processing_entered_ts = None
             if (
                 new_state == IMEState.DISCONNECTED
                 and old_state in (IMEState.RECORDING, IMEState.PROCESSING)
             ):
-                # Unexpected disconnect during an active turn: surface it with a clear sound cue.
                 self._play_sound("Basso")
             if new_state in (IMEState.IDLE, IMEState.DISCONNECTED):
                 self.recording_mode = None
@@ -526,26 +566,66 @@ class BrainwaveIMECore:
             if self.on_state_change:
                 self.on_state_change(new_state)
 
+    def _apply_provider(self, key: str):
+        if self.config.provider == key:
+            return
+        self.config.provider = key
+        print(f"[IME] Provider set to: {key}")
+
+    def _apply_model(self, key: str):
+        if self.config.model == key:
+            return
+        self.config.model = key
+        print(f"[IME] Model set to: {key}")
+
     def _play_sound(self, sound_name: str):
         try:
-            # Launch immediately in caller thread to reduce scheduling jitter,
-            # then reap in background to avoid zombie processes.
-            proc = subprocess.Popen(
-                ['afplay', f'/System/Library/Sounds/{sound_name}.aiff'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            threading.Thread(target=proc.wait, daemon=True).start()
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        loop = running_loop or self.loop
+        if loop is None or not loop.is_running():
+            print(f"[IME] Sound skipped ({sound_name}): asyncio loop is not running")
+            return
+
+        def schedule():
+            asyncio.ensure_future(self._play_sound_async(sound_name))
+
+        try:
+            if running_loop is loop:
+                schedule()
+            else:
+                loop.call_soon_threadsafe(schedule)
         except Exception as exc:
             print(f"[IME] Sound play error ({sound_name}): {exc}")
 
+    async def _play_sound_async(self, sound_name: str):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'afplay',
+                f'/System/Library/Sounds/{sound_name}.aiff',
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            asyncio.create_task(self._reap_sound_process(proc, sound_name))
+        except Exception as exc:
+            print(f"[IME] Sound play error ({sound_name}): {exc}")
+
+    async def _reap_sound_process(self, proc, sound_name: str):
+        try:
+            await proc.wait()
+        except Exception as exc:
+            print(f"[IME] Sound reap error ({sound_name}): {exc}")
+
     async def connect_websocket(self):
+        self._ensure_audio_pipeline()
         uri = f"ws://{self.config.server_host}:{self.config.server_port}/api/v1/ws"
         try:
             self.ws = await websockets.connect(uri)
             self.ws_connected = True
             self._ws_connected_wall_ts = time.time()
-            if self.state in (IMEState.DISCONNECTED, IMEState.IDLE):
+            if self.state != IMEState.RECORDING:
                 self._set_state(IMEState.IDLE)
             print(f"[IME] Connected to {uri}")
             if self._receive_task is None or self._receive_task.done():
@@ -567,11 +647,44 @@ class BrainwaveIMECore:
                 pass
             self._receive_task = None
         if self.ws:
-            await self.ws.close()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
             self.ws = None
         self.ws_connected = False
         self._ws_connected_wall_ts = None
         self._set_state(IMEState.DISCONNECTED)
+
+    async def _safe_close_ws(self):
+        """Best-effort close of the WebSocket, safe to call from any state."""
+        try:
+            if self.ws:
+                await self.ws.close()
+        except Exception:
+            pass
+
+    async def _async_watchdog_cleanup(self):
+        """Watchdog cleanup running inside the asyncio loop for thread safety."""
+        if self._receive_task:
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._receive_task = None
+        if self._session_task and not self._session_task.done():
+            self._session_task.cancel()
+            self._session_task = None
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+        self.ws_connected = False
+        self._session_started = False
+        self._set_state(IMEState.IDLE)
 
     async def receive_messages(self):
         try:
@@ -585,6 +698,7 @@ class BrainwaveIMECore:
             self.ws = None
             self._ws_connected_wall_ts = None
             self._session_started = False
+            self._receive_task = None
             if self.state in (IMEState.RECORDING, IMEState.PROCESSING):
                 print("[IME] Connection lost during active turn, keep local recording and retry session.")
                 self._start_session_task()
@@ -598,6 +712,7 @@ class BrainwaveIMECore:
             self.ws = None
             self._ws_connected_wall_ts = None
             self._session_started = False
+            self._receive_task = None
             if self.state in (IMEState.RECORDING, IMEState.PROCESSING):
                 self._start_session_task()
             else:
@@ -842,12 +957,75 @@ class BrainwaveIMECore:
         except Exception:
             return False
 
-    def start_recording(self):
+    async def _handle_hotkey(self):
+        """快捷键按下 - 在 asyncio loop 内切换录音状态"""
+        if self.state == IMEState.RECORDING:
+            await self._stop_recording()
+        elif self.state == IMEState.IDLE:
+            self._hotkey_down_ts = time.perf_counter()
+            await self._start_recording()
+        # 如果是 PROCESSING 或 DISCONNECTED 状态则忽略
+
+    def _enqueue_audio(self, data, ts, turn_id):
+        if self._audio_queue is None:
+            self._audio_drop_count += 1
+            return
+        try:
+            self._audio_queue.put_nowait((data, ts, turn_id))
+        except asyncio.QueueFull:
+            self._audio_drop_count += 1
+
+    async def _audio_consumer_loop(self):
+        while True:
+            item = await self._audio_queue.get()
+            try:
+                if item is None:
+                    self._audio_drained.set()
+                    continue
+
+                chunk, ts, turn_id = item
+
+                if self._audio_consumer_paused or turn_id != self._active_turn_id:
+                    continue
+
+                self._last_audio_callback_ts = ts
+                resampled = self.audio_processor.resample(chunk)
+                self._local_turn_audio.extend(resampled)
+                self._trim_local_audio()
+                self._append_audio_buffer(resampled)
+
+                while (
+                    self._audio_buffer_samples >= self._upload_chunk_samples
+                    and self.ws
+                    and self.ws_connected
+                    and self._session_started
+                ):
+                    combined = b''.join(self.audio_buffer)
+                    send_buffer = combined[:self._upload_chunk_bytes]
+                    remaining = combined[self._upload_chunk_bytes:]
+                    self._clear_audio_buffer()
+                    if remaining:
+                        self._append_audio_buffer(remaining)
+                    try:
+                        await self.ws.send(send_buffer)
+                    except Exception as exc:
+                        print(f"[IME] Audio send error: {exc}")
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[IME] Audio consumer error: {exc}")
+            finally:
+                self._audio_queue.task_done()
+
+    async def _start_recording(self):
         if self.state not in (IMEState.IDLE,):
             return
 
+        self._ensure_audio_pipeline()
         self._turn_id += 1
         self._active_turn_id = self._turn_id
+        self._current_stream_turn_id = self._active_turn_id
         self._force_ws_refresh_before_turn = self._should_refresh_ws_before_turn()
         if self._force_ws_refresh_before_turn:
             idle_sec, idle_basis = self._compute_idle_ws_age_sec()
@@ -873,28 +1051,57 @@ class BrainwaveIMECore:
         self._clear_audio_buffer()
         self._last_audio_callback_ts = None
         self._local_turn_audio = bytearray()
+        self._audio_drained.clear()
+        self._audio_consumer_paused = False
         print(
             f"[Perf][T{self._active_turn_id}] latency_preset={self.config.latency_preset} "
             f"upload_chunk_ms={self.config.upload_chunk_ms} "
             f"(samples={self._upload_chunk_samples}), callback_chunk_frames={self._chunk_size_frames}"
         )
 
-        try:
-            self.audio_stream = self.pyaudio_instance.open(
+        stream_turn_id = self._current_stream_turn_id
+        loop = self.loop
+        enqueue_audio = self._enqueue_audio
+
+        def _audio_callback(in_data, frame_count, time_info, status_flags):
+            ts = time.perf_counter()
+            if loop:
+                try:
+                    loop.call_soon_threadsafe(
+                        enqueue_audio,
+                        in_data,
+                        ts,
+                        stream_turn_id,
+                    )
+                except RuntimeError:
+                    pass
+            return (None, pyaudio.paContinue)
+
+        def open_stream():
+            stream = self.pyaudio_instance.open(
                 format=pyaudio.paInt16,
                 channels=self.config.channels,
                 rate=self.config.sample_rate,
                 input=True,
                 frames_per_buffer=self._chunk_size_frames,
-                stream_callback=self._audio_callback
+                stream_callback=_audio_callback
             )
-            self.audio_stream.start_stream()
+            stream.start_stream()
+            return stream
+
+        try:
+            self.audio_stream = await self.loop.run_in_executor(
+                self._pyaudio_executor,
+                open_stream,
+            )
             self._recording_started_ts = time.perf_counter()
             if self._hotkey_down_ts is not None:
                 hotkey_to_recording_ms = (self._recording_started_ts - self._hotkey_down_ts) * 1000
                 print(f"[Perf][T{self._active_turn_id}] hotkey_to_recording_ms={hotkey_to_recording_ms:.1f}")
         except Exception as e:
             print(f"[IME] Audio error: {e}")
+            self._audio_consumer_paused = True
+            self._audio_drained.set()
             self._set_state(IMEState.IDLE)
             return
 
@@ -928,32 +1135,7 @@ class BrainwaveIMECore:
                 self.ws = None
                 await asyncio.sleep(retry_interval_sec)
 
-    def _audio_callback(self, in_data, frame_count, time_info, status):
-        if self.state in (IMEState.RECORDING, IMEState.PROCESSING):
-            self._last_audio_callback_ts = time.perf_counter()
-            resampled = self.audio_processor.resample(in_data)
-            self._local_turn_audio.extend(resampled)
-            self._trim_local_audio()
-            self._append_audio_buffer(resampled)
-
-            if (
-                self._audio_buffer_samples >= self._upload_chunk_samples
-                and self.ws_connected
-                and self._session_started
-            ):
-                combined = b''.join(self.audio_buffer)
-                send_buffer = combined[:self._upload_chunk_bytes]
-                remaining = combined[self._upload_chunk_bytes:]
-                self._clear_audio_buffer()
-                if remaining:
-                    self._append_audio_buffer(remaining)
-                if self.loop:
-                    asyncio.run_coroutine_threadsafe(
-                        self.ws.send(send_buffer), self.loop
-                    )
-        return (None, pyaudio.paContinue)
-
-    def stop_recording(self):
+    async def _stop_recording(self):
         if self.state != IMEState.RECORDING:
             return
 
@@ -962,8 +1144,7 @@ class BrainwaveIMECore:
         self.transcript = ""
         self._set_state(IMEState.PROCESSING)
 
-        if self.loop:
-            asyncio.run_coroutine_threadsafe(self._async_stop(), self.loop)
+        await self._async_stop()
 
     async def _async_stop(self):
         # 自适应等待尾音：至少等待一个回调周期+保护时间，且保留保守下限。
@@ -971,12 +1152,18 @@ class BrainwaveIMECore:
         print(f"[Perf][T{self._active_turn_id}] stop_tail_wait_ms={tail_wait_sec * 1000:.1f}")
         await asyncio.sleep(tail_wait_sec)
 
-        self._close_audio_stream()
+        self._audio_consumer_paused = True
+        await self._close_audio_stream()
+
+        if self._audio_queue is not None:
+            self._audio_drained.clear()
+            await self._audio_queue.put(None)
+            await self._audio_drained.wait()
 
         # Give session startup a last chance before declaring upload failure.
         if not self._session_started and self._session_task and not self._session_task.done():
             try:
-                await asyncio.wait_for(asyncio.wrap_future(self._session_task), timeout=1.5)
+                await asyncio.wait_for(self._session_task, timeout=1.5)
             except Exception:
                 pass
 
@@ -1001,25 +1188,63 @@ class BrainwaveIMECore:
             self._play_sound("Basso")
             self._set_state(IMEState.IDLE)
 
-    def on_hotkey_press(self):
-        """快捷键按下 - 切换录音状态"""
-        if self.state == IMEState.IDLE:
-            self._hotkey_down_ts = time.perf_counter()
-            self.start_recording()
-        elif self.state == IMEState.RECORDING:
-            self.stop_recording()
-        # 如果是 PROCESSING 或 DISCONNECTED 状态则忽略
+    async def _check_processing_timeout_async(self) -> bool:
+        if (
+            self.state == IMEState.PROCESSING
+            and self._processing_entered_ts is not None
+            and self.config.processing_timeout_sec > 0
+        ):
+            elapsed = time.perf_counter() - self._processing_entered_ts
+            if elapsed >= self.config.processing_timeout_sec:
+                print(
+                    f"[IME] Processing watchdog triggered after {elapsed:.1f}s "
+                    f"(limit={self.config.processing_timeout_sec}s), forcing idle"
+                )
+                self._processing_entered_ts = None
+                await self._close_audio_stream()
+                self._archive_recent_turn_audio("processing_timeout")
+                self._play_sound("Basso")
+                await self._async_watchdog_cleanup()
+                return True
+        return False
 
     def on_hotkey_down(self):
         """快捷键按下 (兼容旧接口)"""
-        self.on_hotkey_press()
+        if self.loop:
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._handle_hotkey())
+            )
 
     def on_hotkey_up(self):
         """快捷键释放 (切换模式下不需要处理)"""
         pass
 
+    async def _cleanup_async_resources(self):
+        self._audio_consumer_paused = True
+        await self._close_audio_stream()
+        if self._audio_consumer_task and not self._audio_consumer_task.done():
+            self._audio_consumer_task.cancel()
+            try:
+                await self._audio_consumer_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                print(f"[IME] Audio consumer cleanup error: {exc}")
+        self._audio_consumer_task = None
+
     def cleanup(self):
-        self._close_audio_stream()
+        if self.loop and self.loop.is_running():
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._cleanup_async_resources(),
+                    self.loop,
+                )
+                future.result(timeout=2)
+            except Exception as exc:
+                print(f"[IME] Async cleanup error: {exc}")
+                self._close_audio_stream_sync()
+        else:
+            self._close_audio_stream_sync()
         if self._recent_audio_worker:
             self._recent_audio_worker_stop.set()
             if not self._enqueue_recent_audio_task(None):
@@ -1034,6 +1259,7 @@ class BrainwaveIMECore:
                     pass
             self._recent_audio_worker.join(timeout=0.5)
         self.pyaudio_instance.terminate()
+        self._pyaudio_executor.shutdown(wait=True, cancel_futures=True)
 
 
 if HAS_RUMPS:
@@ -1041,16 +1267,16 @@ if HAS_RUMPS:
         """macOS 菜单栏应用"""
 
         STATE_ICONS = {
-            IMEState.IDLE: "🎤",
-            IMEState.RECORDING: "🟣",
-            IMEState.PROCESSING: "⏳",
-            IMEState.DISCONNECTED: "⚫",
+            IMEState.IDLE: "🎙️",
+            IMEState.RECORDING: "🔴",
+            IMEState.PROCESSING: "✨",
+            IMEState.DISCONNECTED: "⛔",
         }
         STATUS_GUIDE = [
-            ("idle", IMEState.IDLE, None, "🎤 Idle - Ready (not recording)"),
-            ("recording_optimized", IMEState.RECORDING, None, "🟣 Recording - Listening"),
-            ("processing", IMEState.PROCESSING, None, "⏳ Processing - Transcribing"),
-            ("disconnected", IMEState.DISCONNECTED, None, "⚫ Disconnected - Server offline"),
+            ("idle", IMEState.IDLE, None, "🎙️ Idle - Ready"),
+            ("recording_optimized", IMEState.RECORDING, None, "🔴 Recording - Listening"),
+            ("processing", IMEState.PROCESSING, None, "✨ Processing - Transcribing"),
+            ("disconnected", IMEState.DISCONNECTED, None, "⛔ Disconnected"),
         ]
         PROVIDER_OPTIONS = [
             ("openai", "OpenAI"),
@@ -1062,7 +1288,7 @@ if HAS_RUMPS:
         ]
 
         def __init__(self):
-            super().__init__("⚫", quit_button=None)
+            super().__init__("⛔", quit_button=None)
             self.config = Config()
             self.core = BrainwaveIMECore(
                 self.config,
@@ -1073,15 +1299,11 @@ if HAS_RUMPS:
 
             self.provider_labels = {key: label for key, label in self.PROVIDER_OPTIONS}
             self.model_labels = {key: label for key, label in self.MODEL_OPTIONS}
+            self._selected_provider = self.config.provider
+            self._selected_model = self.config.model
             self.status_item = rumps.MenuItem("Status: Disconnected", callback=self._noop)
-            self.status_guide_header = rumps.MenuItem("States", callback=self._noop)
-            self.status_guide_items = {}
-            self.status_guide_labels = {}
-            for key, state, mode, label in self.STATUS_GUIDE:
-                self.status_guide_labels[key] = label
-                item = rumps.MenuItem(label, callback=self._noop)
-                self.status_guide_items[key] = item
             self.reconnect_item = rumps.MenuItem("Reconnect", callback=self.reconnect)
+            self.restart_item = rumps.MenuItem("Restart Service", callback=self._restart_service)
 
             self.provider_menu = rumps.MenuItem("Provider")
             self.provider_items = {}
@@ -1115,9 +1337,6 @@ if HAS_RUMPS:
 
             self.menu = [
                 self.status_item,
-                self.status_guide_header,
-                *list(self.status_guide_items.values()),
-                self.reconnect_item,
                 None,
                 self.provider_menu,
                 self.model_menu,
@@ -1125,6 +1344,9 @@ if HAS_RUMPS:
                 None,
                 self._recent_item,
                 self._history_item,
+                None,
+                self.reconnect_item,
+                self.restart_item,
                 None,
                 rumps.MenuItem("Quit", callback=self.quit_app),
             ]
@@ -1183,14 +1405,15 @@ if HAS_RUMPS:
 
                         # 监听 Cmd + ` (keycode 50) - 触发优化模式
                         if keycode == self.config.hotkey_keycode and cmd_pressed:
-                            print(f"[EventTap] Optimize hotkey pressed, current state: {self.core.state.value}")
-                            # 直接调用核心方法（线程安全，因为只修改状态）
-                            self.core.on_hotkey_press()
                             # 标记为 Null 事件，避免系统默认切换窗口导致光标跳走
                             try:
                                 CGEventSetType(event, kCGEventNull)
                             except Exception as exc:
                                 print(f"[EventTap] Failed to nullify event: {exc}")
+                            if self.loop:
+                                self.loop.call_soon_threadsafe(
+                                    lambda: asyncio.ensure_future(self.core._handle_hotkey())
+                                )
                             return event
                     except Exception as e:
                         print(f"[EventTap] Error: {e}")
@@ -1280,55 +1503,58 @@ if HAS_RUMPS:
             return self.STATE_ICONS.get(state, "🎤")
 
         def _model_label(self) -> str:
-            return self.model_labels.get(self.config.model, self.config.model)
+            return self.model_labels.get(self._selected_model, self._selected_model)
 
         def _sync_status_menu(self, state: IMEState):
             icon = self._current_state_icon(state)
-            self.status_item.title = f"Status: {icon} {state.value.capitalize()} | Model: {self._model_label()}"
+            self.status_item.title = f"{icon} {state.value.capitalize()} · {self._model_label()}"
             self.reconnect_item._menuitem.setEnabled_(state == IMEState.DISCONNECTED)
-            for key, menu_state, mode, _label in self.STATUS_GUIDE:
-                item = self.status_guide_items[key]
-                base_label = self.status_guide_labels.get(key, _label)
-                is_current = menu_state == state and (mode is None or self.core.recording_mode == mode)
-                marker = "•" if is_current else " "
-                item.title = f"{marker} {base_label}"
-                item.state = 0
 
         def _sync_provider_menu(self):
             for key, item in self.provider_items.items():
-                item.state = 1 if key == self.config.provider else 0
+                item.state = 1 if key == self._selected_provider else 0
 
         def _sync_model_menu(self):
             for key, item in self.model_items.items():
-                item.state = 1 if key == self.config.model else 0
+                item.state = 1 if key == self._selected_model else 0
 
         def _provider_selected(self, sender):
-            provider_key = getattr(sender, "_provider_key", None)
-            if provider_key:
-                self.set_provider(provider_key)
+            self.set_provider(sender)
 
         def _model_selected(self, sender):
-            model_key = getattr(sender, "_model_key", None)
-            if model_key:
-                self.set_model(model_key)
+            self.set_model(sender)
 
-        def set_provider(self, provider_key: str):
+        def set_provider(self, sender):
+            provider_key = getattr(sender, "_provider_key", None)
             if provider_key not in self.provider_labels:
                 print(f"[UI] Unknown provider: {provider_key}")
                 return
-            if self.config.provider == provider_key:
+            if self._selected_provider == provider_key:
                 return
-            self.config.provider = provider_key
+            if not self.loop:
+                print("[UI] Provider change skipped: asyncio loop is not running")
+                return
+            self.loop.call_soon_threadsafe(
+                lambda: self.core._apply_provider(provider_key)
+            )
+            self._selected_provider = provider_key
             self._sync_provider_menu()
             self._sync_status_menu(self.core.state)
 
-        def set_model(self, model_key: str):
+        def set_model(self, sender):
+            model_key = getattr(sender, "_model_key", None)
             if model_key not in self.model_labels:
                 print(f"[UI] Unknown model: {model_key}")
                 return
-            if self.config.model == model_key:
+            if self._selected_model == model_key:
                 return
-            self.config.model = model_key
+            if not self.loop:
+                print("[UI] Model change skipped: asyncio loop is not running")
+                return
+            self.loop.call_soon_threadsafe(
+                lambda: self.core._apply_model(model_key)
+            )
+            self._selected_model = model_key
             self._sync_model_menu()
             self._sync_status_menu(self.core.state)
 
@@ -1337,8 +1563,92 @@ if HAS_RUMPS:
                 return
             self._connect()
 
+        def _restart_service(self, _):
+            """Menu callback. Dispatch to asyncio loop, return immediately."""
+            print("[App] Restart Service requested by user")
+            if self.loop:
+                self.loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(self._restart_service_async())
+                )
+
+        async def _restart_service_async(self):
+            try:
+                await self.core._close_audio_stream()
+                await self.core.disconnect_websocket()
+
+                self.core.ws = None
+                self.core.ws_connected = False
+                self.core._ws_connected_wall_ts = None
+                self.core._session_started = False
+                if self.core._session_task and not self.core._session_task.done():
+                    self.core._session_task.cancel()
+                self.core._session_task = None
+                self.core._receive_task = None
+                self.core._processing_entered_ts = None
+                self.core._set_state(IMEState.DISCONNECTED)
+
+                await self.loop.run_in_executor(None, self._terminate_server_processes)
+
+                for _ in range(20):
+                    if not self._is_server_port_open():
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    print("[App] Warning: server port still open after terminate")
+
+                venv_python = os.path.join(PROJECT_DIR, "venv", "bin", "python")
+                server_script = os.path.join(PROJECT_DIR, "realtime_server.py")
+                python_bin = venv_python if os.path.exists(venv_python) else sys.executable
+                try:
+                    proc = subprocess.Popen(
+                        [python_bin, server_script],
+                        cwd=PROJECT_DIR,
+                        env=os.environ.copy(),
+                        start_new_session=True,
+                    )
+                    self._write_server_pid_file(proc.pid)
+                    print(f"[App] Server restarted: PID {proc.pid}: {python_bin} {server_script}")
+                except Exception as exc:
+                    print(f"[App] Failed to restart server: {exc}")
+
+                server_ready = False
+                for _ in range(40):
+                    if self._is_server_port_open():
+                        server_ready = True
+                        break
+                    await asyncio.sleep(0.1)
+
+                if server_ready:
+                    await self._connect_async()
+                elif self.loop:
+                    print("[App] Warning: server not ready after restart poll; scheduling reconnect")
+                    self.loop.call_later(
+                        2.0,
+                        lambda: asyncio.ensure_future(self._connect_async())
+                    )
+                else:
+                    threading.Timer(2.0, self._connect).start()
+            except Exception as exc:
+                print(f"[App] Restart service error: {exc}")
+
+        def _is_server_port_open(self) -> bool:
+            import socket
+
+            host = (
+                "127.0.0.1"
+                if self.config.server_host == "localhost"
+                else self.config.server_host
+            )
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.1)
+            try:
+                return sock.connect_ex((host, self.config.server_port)) == 0
+            finally:
+                sock.close()
+
         def _poll_state(self, timer):
             """定时器回调 - 在主线程检查并更新 UI"""
+            current_state = self.core.state
             if self._accessibility_warning_needed and not self._accessibility_warning_sent:
                 self._accessibility_warning_sent = True
                 self._show_accessibility_warning()
@@ -1346,7 +1656,6 @@ if HAS_RUMPS:
                 self._input_monitoring_warning_sent = True
                 self._show_input_monitoring_warning()
             self._drain_pending_transcripts()
-            current_state = self.core.state
             if current_state != self._last_state:
                 self._last_state = current_state
                 icon = self._current_state_icon(current_state)
@@ -1354,6 +1663,10 @@ if HAS_RUMPS:
                 self.title = icon
                 self._sync_status_menu(current_state)
                 print(f"[UI] Title is now: {self.title}")
+            if self.loop:
+                self.loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(self.core._check_processing_timeout_async())
+                )
 
         def _on_state_change(self, state: IMEState):
             """状态变更回调 - 状态会被定时器轮询更新到 UI"""
@@ -1545,7 +1858,67 @@ if HAS_RUMPS:
             except Exception as exc:
                 print(f"[History] Clipboard copy failed: {exc}")
 
-        def _terminate_server_processes(self):
+        def _write_server_pid_file(self, pid: int):
+            try:
+                os.makedirs(PID_DIR, exist_ok=True)
+                with open(SERVER_PID_FILE, "w") as handle:
+                    handle.write(str(pid))
+            except Exception as exc:
+                print(f"[App] Failed to write server PID file: {exc}")
+
+        def _remove_server_pid_file(self):
+            try:
+                os.remove(SERVER_PID_FILE)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                print(f"[App] Failed to remove server PID file: {exc}")
+
+        def _read_server_pid_file(self) -> Optional[int]:
+            try:
+                with open(SERVER_PID_FILE, "r") as handle:
+                    raw_pid = handle.read().strip()
+            except FileNotFoundError:
+                return None
+            except Exception as exc:
+                print(f"[App] Failed to read server PID file: {exc}")
+                return None
+
+            try:
+                return int(raw_pid)
+            except ValueError:
+                print(f"[App] Ignoring invalid server PID file: {raw_pid!r}")
+                return None
+
+        def _server_command_for_pid(self, pid: int) -> Optional[str]:
+            try:
+                output = subprocess.check_output(
+                    ["/bin/ps", "-p", str(pid), "-o", "command="],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+            except subprocess.CalledProcessError:
+                return None
+            except Exception as exc:
+                print(f"[App] Failed to inspect PID {pid}: {exc}")
+                return None
+
+            command = output.strip()
+            return command or None
+
+        def _command_matches_server(self, command: str) -> bool:
+            return "realtime_server.py" in command and PROJECT_DIR in command
+
+        def _pid_is_alive(self, pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+
+        def _find_server_processes_by_ps(self) -> list[tuple[int, str]]:
             try:
                 output = subprocess.check_output(
                     ["/bin/ps", "-x", "-o", "pid=,command="],
@@ -1553,7 +1926,7 @@ if HAS_RUMPS:
                 )
             except Exception as exc:
                 print(f"[App] Failed to list processes: {exc}")
-                return
+                return []
 
             current_pid = os.getpid()
             matches = []
@@ -1571,12 +1944,24 @@ if HAS_RUMPS:
                 if pid == current_pid:
                     continue
 
-                if "realtime_server.py" in cmd and PROJECT_DIR in cmd:
+                if self._command_matches_server(cmd):
                     matches.append((pid, cmd))
 
+            return matches
+
+        def _stop_server_processes(self, matches: list[tuple[int, str]]):
             if not matches:
                 return
 
+            unique_matches = []
+            seen_pids = set()
+            for pid, cmd in matches:
+                if pid in seen_pids:
+                    continue
+                seen_pids.add(pid)
+                unique_matches.append((pid, cmd))
+
+            matches = unique_matches
             print(f"[App] Stopping {len(matches)} server process(es)...")
             for pid, cmd in matches:
                 try:
@@ -1587,14 +1972,42 @@ if HAS_RUMPS:
                 except Exception as exc:
                     print(f"[App] Failed to terminate PID {pid}: {exc}")
 
-            time.sleep(0.5)
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                if not any(self._pid_is_alive(pid) for pid, _ in matches):
+                    break
+                time.sleep(0.05)
+
             for pid, cmd in matches:
+                if not self._pid_is_alive(pid):
+                    continue
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     continue
                 except Exception as exc:
                     print(f"[App] Failed to kill PID {pid}: {exc}")
+
+        def _terminate_server_processes(self):
+            matches = []
+            pid = self._read_server_pid_file()
+
+            if pid is not None:
+                command = self._server_command_for_pid(pid)
+                if command and self._command_matches_server(command):
+                    matches = [(pid, command)]
+                elif command:
+                    print(f"[App] Ignoring stale server PID {pid}: {command}")
+                else:
+                    print(f"[App] Ignoring stale server PID {pid}: process not found")
+
+            if not matches:
+                matches = self._find_server_processes_by_ps()
+
+            if matches:
+                self._stop_server_processes(matches)
+
+            self._remove_server_pid_file()
 
         def _connect(self):
             if self.loop is None:
@@ -1606,10 +2019,13 @@ if HAS_RUMPS:
                 self.loop_thread.start()
                 self.core.loop = self.loop
 
-            asyncio.run_coroutine_threadsafe(
-                self.core.connect_websocket(),
-                self.loop
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._connect_async())
             )
+
+        async def _connect_async(self):
+            self.core._ensure_audio_pipeline()
+            await self.core.connect_websocket()
 
         def quit_app(self, _):
             self._terminate_server_processes()
@@ -1622,8 +2038,10 @@ if HAS_RUMPS:
                     future.result(timeout=2)
                 except Exception as exc:
                     print(f"[App] Failed to disconnect websocket cleanly: {exc}")
+                self.core.cleanup()
                 self.loop.call_soon_threadsafe(self.loop.stop)
-            self.core.cleanup()
+            else:
+                self.core.cleanup()
             rumps.quit_application()
 
 

@@ -70,7 +70,16 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             )
         
         # Wait for session creation
-        response = await self.ws.recv()
+        try:
+            response = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.error("Timeout waiting for OpenAI session.created")
+            try:
+                await asyncio.wait_for(self.ws.close(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                logger.warning("Timeout or error closing half-open OpenAI WebSocket after session.created timeout")
+            self.ws = None
+            raise
         response_data = json.loads(response)
         if response_data["type"] == "session.created":
             self.session_id = response_data["session"]["id"]
@@ -216,12 +225,10 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
     
     async def commit_audio(self):
         """Commit the audio buffer and notify OpenAI"""
-        if self._is_ws_open():
-            commit_message = json.dumps({"type": "input_audio_buffer.commit"})
-            await self.ws.send(commit_message)
-            logger.info("Sent input_audio_buffer.commit message to OpenAI")
-        else:
-            raise ConnectionError("WebSocket is not open. Cannot commit audio.")
+        self._require_ws_open()
+        commit_message = json.dumps({"type": "input_audio_buffer.commit"})
+        await self.ws.send(commit_message)
+        logger.info("Sent input_audio_buffer.commit message to OpenAI")
     
     async def clear_audio_buffer(self):
         """Clear the audio buffer"""
@@ -234,36 +241,39 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
     
     async def start_response(self, instructions: str):
         """Start a new response with given instructions"""
-        if self._is_ws_open():
-            response_config = {
-                "output_modalities": ["text"],
-            }
-            if self.include_instructions_each_response and instructions:
-                response_config["instructions"] = instructions
+        self._require_ws_open()
+        response_config = {
+            "output_modalities": ["text"],
+        }
+        if self.include_instructions_each_response and instructions:
+            response_config["instructions"] = instructions
 
-            await self.ws.send(json.dumps({
-                "type": "response.create",
-                "response": response_config
-            }))
-            logger.info(
-                "Started response (text-only)"
-                + (
-                    " (with per-response instructions)"
-                    if self.include_instructions_each_response
-                    else " (session instructions only)"
-                )
+        await self.ws.send(json.dumps({
+            "type": "response.create",
+            "response": response_config
+        }))
+        logger.info(
+            "Started response (text-only)"
+            + (
+                " (with per-response instructions)"
+                if self.include_instructions_each_response
+                else " (session instructions only)"
             )
-        else:
-            raise ConnectionError("WebSocket is not open. Cannot start response.")
+        )
     
     async def close(self):
         """Close the WebSocket connection"""
-        if self.ws:
-            await self.ws.close()
-            logger.info("Closed OpenAI WebSocket connection")
         if self.receive_task:
             self.receive_task.cancel()
             try:
-                await self.receive_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self.receive_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
+            self.receive_task = None
+        if self.ws:
+            try:
+                await asyncio.wait_for(self.ws.close(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            self.ws = None
+            logger.info("Closed OpenAI WebSocket connection")

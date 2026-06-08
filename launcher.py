@@ -32,6 +32,11 @@ def _cleanup_server():
             proc.kill()
         except Exception:
             pass
+    finally:
+        try:
+            os.remove(SERVER_PID_FILE)
+        except FileNotFoundError:
+            pass
 
 
 def _signal_handler(signum, frame):
@@ -45,7 +50,9 @@ def _signal_handler(signum, frame):
 # 项目目录/资源目录
 PROJECT_DIR = os.path.abspath(os.path.dirname(__file__))
 RESOURCE_DIR = PROJECT_DIR
-APP_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/Brainwave IME")
+PID_DIR = os.path.expanduser("~/Library/Application Support/Brainwave IME")
+SERVER_PID_FILE = os.path.join(PID_DIR, "server.pid")
+APP_SUPPORT_DIR = PID_DIR
 
 _SINGLE_INSTANCE_PATTERNS = [
     PROJECT_DIR,
@@ -225,6 +232,9 @@ def start_server_subprocess():
         cwd=PROJECT_DIR,
         env=env,
     )
+    os.makedirs(PID_DIR, exist_ok=True)
+    with open(SERVER_PID_FILE, 'w') as f:
+        f.write(str(proc.pid))
     print(f"[Launcher] Server process started: PID {proc.pid}")
     return proc
 

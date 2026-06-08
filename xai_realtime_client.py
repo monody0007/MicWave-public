@@ -98,8 +98,17 @@ class XAIRealtimeAudioTextClient(RealtimeClientBase):
             )
         
         # Wait for initial message (conversation.created)
-        response = await self.ws.recv()
-        response_data = json.loads(response)
+        try:
+            response = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
+            response_data = json.loads(response)
+        except asyncio.TimeoutError:
+            logger.error("Timeout waiting for x.ai conversation.created")
+            try:
+                await asyncio.wait_for(self.ws.close(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                logger.warning("Timeout or error closing half-open x.ai WebSocket after conversation.created timeout")
+            self.ws = None
+            raise
         
         if response_data.get("type") == "conversation.created":
             conversation_id = response_data.get("conversation", {}).get("id")
@@ -107,8 +116,17 @@ class XAIRealtimeAudioTextClient(RealtimeClientBase):
         elif response_data.get("type") == "ping":
             # x.ai may send ping first, wait for conversation.created
             logger.debug("Received ping, waiting for conversation.created...")
-            response = await self.ws.recv()
-            response_data = json.loads(response)
+            try:
+                response = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
+                response_data = json.loads(response)
+            except asyncio.TimeoutError:
+                logger.error("Timeout waiting for x.ai conversation.created after ping")
+                try:
+                    await asyncio.wait_for(self.ws.close(), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    logger.warning("Timeout or error closing half-open x.ai WebSocket after conversation.created timeout")
+                self.ws = None
+                raise
             if response_data.get("type") == "conversation.created":
                 conversation_id = response_data.get("conversation", {}).get("id")
                 logger.info(f"Conversation created with ID: {conversation_id}")
@@ -219,12 +237,10 @@ class XAIRealtimeAudioTextClient(RealtimeClientBase):
     
     async def commit_audio(self):
         """Commit the audio buffer and notify x.ai"""
-        if self._is_ws_open():
-            commit_message = json.dumps({"type": "input_audio_buffer.commit"})
-            await self.ws.send(commit_message)
-            logger.info("Sent input_audio_buffer.commit message to x.ai")
-        else:
-            logger.error("WebSocket is not open. Cannot commit audio.")
+        self._require_ws_open()
+        commit_message = json.dumps({"type": "input_audio_buffer.commit"})
+        await self.ws.send(commit_message)
+        logger.info("Sent input_audio_buffer.commit message to x.ai")
     
     async def clear_audio_buffer(self):
         """Clear the audio buffer"""
@@ -244,30 +260,33 @@ class XAIRealtimeAudioTextClient(RealtimeClientBase):
             modalities: List of output modalities. Defaults to XAI_REALTIME_MODALITIES config.
                        Use ["text"] for text-only output, ["text", "audio"] for both.
         """
-        if self._is_ws_open():
-            # Use provided modalities or fall back to config
-            output_modalities = modalities or XAI_REALTIME_MODALITIES
-            await self.ws.send(json.dumps({
-                "type": "response.create",
-                "response": {
-                    "modalities": output_modalities
-                }
-            }))
-            logger.info(f"Started response with modalities: {output_modalities}, instructions: {instructions[:50]}...")
-        else:
-            logger.error("WebSocket is not open. Cannot start response.")
+        self._require_ws_open()
+        # Use provided modalities or fall back to config
+        output_modalities = modalities or XAI_REALTIME_MODALITIES
+        await self.ws.send(json.dumps({
+            "type": "response.create",
+            "response": {
+                "modalities": output_modalities
+            }
+        }))
+        logger.info(f"Started response with modalities: {output_modalities}, instructions: {instructions[:50]}...")
     
     async def close(self):
         """Close the WebSocket connection"""
-        if self.ws:
-            await self.ws.close()
-            logger.info("Closed x.ai WebSocket connection")
         if self.receive_task:
             self.receive_task.cancel()
             try:
-                await self.receive_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self.receive_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
+            self.receive_task = None
+        if self.ws:
+            try:
+                await asyncio.wait_for(self.ws.close(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            self.ws = None
+            logger.info("Closed x.ai WebSocket connection")
     
     async def default_handler(self, data: dict):
         """Default handler for unhandled message types"""
