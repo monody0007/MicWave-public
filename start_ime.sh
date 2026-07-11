@@ -75,8 +75,7 @@ fi
 
 # Load environment variables and API keys from .env.
 # Copy .env.example to .env and fill in your keys.
-# launcher.py does a preflight check; OPENAI_API_KEY is required for the
-# default REALTIME_PROVIDER=openai path, xai/google keys are optional.
+# launcher.py does a preflight check; OPENAI_API_KEY is required.
 if [ -f "$ROOT_DIR/.env" ]; then
     set -a
     . "$ROOT_DIR/.env"

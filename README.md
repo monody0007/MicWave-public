@@ -1,6 +1,6 @@
 # MicWave (Brainwave IME)
 
-macOS 菜单栏语音输入法，按下快捷键说话，转写后的文字自动粘贴到当前焦点应用。底层支持 OpenAI Realtime（默认）、x.ai Grok Realtime、Google Gemini 三种 provider。
+macOS 菜单栏语音输入法，按下快捷键说话，转写后的文字自动粘贴到当前焦点应用。底层使用 OpenAI Realtime API 转写。
 
 ## 项目状态
 
@@ -8,7 +8,7 @@ macOS 菜单栏语音输入法，按下快捷键说话，转写后的文字自�
 
 ## 功能特点
 
-- 多 provider 支持：OpenAI Realtime（默认）、x.ai Grok Realtime、Google Gemini 文件转写
+- OpenAI Realtime 转写：流式 realtime 输出 + gpt-4o-transcribe 输入侧兜底
 - 低延迟：tuned 过的 upload chunking 和 session reuse，`fast` preset 下 stop-to-response 通常在 300ms 以内
 - 菜单栏常驻：低存在感的状态图标，热键 `Cmd+Shift+V` 启停（默认）
 - 可选自启动：通过 LaunchAgent 注册开机自启
@@ -18,7 +18,7 @@ macOS 菜单栏语音输入法，按下快捷键说话，转写后的文字自�
 - macOS（在 Apple Silicon + 最近版本的 Sonoma / Sequoia 上测过）
 - Python 3.11+
 - 一个能用的麦克风
-- 至少一个 provider 的 API key
+- 一个 OpenAI API key
 
 ## 快速上手
 
@@ -30,7 +30,6 @@ cd MicWave-public
 # 2. 配置 secrets
 cp .env.example .env
 # 编辑 .env，填入 OPENAI_API_KEY (必填)
-# XAI_API_KEY / GOOGLE_API_KEY 可选
 
 # 3. 启动（自动建 venv、装依赖、注册 LaunchAgent）
 ./start_ime.sh --install-autostart
@@ -58,7 +57,6 @@ cp .env.example .env
 
 | 变量名                                     | 默认值                | 用途                          |
 |--------------------------------------------|-----------------------|-------------------------------|
-| `REALTIME_PROVIDER`                        | `openai`              | `openai` \| `xai`             |
 | `OPENAI_REALTIME_MODEL`                    | `gpt-realtime-mini-*` | 选用的 OpenAI realtime model  |
 | `BRAINWAVE_LATENCY_PRESET`                 | `fast`                | `fast` \| `balanced`          |
 | `BRAINWAVE_KEEP_PROVIDER_SESSION`          | `1`                   | 复用 WS session（更快）       |
@@ -81,4 +79,4 @@ MIT，详见 [`LICENSE`](LICENSE)。
 
 ## English Summary
 
-A macOS menu-bar voice-to-text input method powered by OpenAI Realtime, x.ai Grok, and Google Gemini. **Archived** — public snapshot of a personal project, no further updates. See sections above (Chinese) for full setup; commands and code are language-agnostic. MIT licensed.
+A macOS menu-bar voice-to-text input method powered by the OpenAI Realtime API. **Archived** — public snapshot of a personal project, no further updates. See sections above (Chinese) for full setup; commands and code are language-agnostic. MIT licensed.

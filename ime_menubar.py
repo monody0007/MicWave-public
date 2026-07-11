@@ -206,7 +206,40 @@ class BrainwaveIMECore:
         self.on_transcript = on_transcript
         self.on_transcript_complete = on_transcript_complete
         self._receive_task = None
-        self._session_started = False
+        # Two-state session lifecycle (task 0436 S2):
+        #   _start_requested  — start_recording message has been sent
+        #   _server_connected — matching-turn `status=connected` ack received
+        # Audio is only uploaded (and removed from the local upload buffer) once
+        # _server_connected is True, so a confirmation failure never drops the
+        # already-recorded PCM — it stays buffered and is retransmitted after the
+        # rebuild finally connects.
+        self._start_requested = False
+        # `_server_connected` is a property backed by this Event (task 0436
+        # R3-M1) so the stop path can await the matching-turn `connected` ack as
+        # a single source of truth instead of a separate bool that can drift.
+        self._server_connected_event: asyncio.Event = asyncio.Event()
+        self._server_connected = False
+        # Bounded backoff for the confirmation-failure retry loop so a failing
+        # session start during recording cannot become a retry storm (S2).
+        self._session_start_attempts = 0
+        self._max_session_start_attempts = max(
+            1, int(os.getenv("BRAINWAVE_SESSION_START_MAX_ATTEMPTS", "5"))
+        )
+        self._session_start_backoff_base_sec = float(
+            os.getenv("BRAINWAVE_SESSION_START_BACKOFF_BASE_SEC", "0.5")
+        )
+        self._session_start_backoff_cap_sec = float(
+            os.getenv("BRAINWAVE_SESSION_START_BACKOFF_CAP_SEC", "5.0")
+        )
+        # Confirmation budget the stop path waits for a slow-but-legitimate
+        # session start to reach the matching-turn `connected` ack before
+        # declaring upload failure (task 0436 R3-M1). Aligned to the server
+        # confirmation contract (5s + one 5s resend) plus margin. The old 1.5s
+        # hard wait cancelled a ~3s start that would otherwise have succeeded.
+        self._stop_session_connect_deadline_sec = max(
+            0.0,
+            float(os.getenv("BRAINWAVE_STOP_SESSION_CONNECT_DEADLINE_SEC", "11.0")),
+        )
         self._session_task = None
         self._session_prompt_mode = "optimize"
         self._force_ws_refresh_before_turn = False
@@ -278,6 +311,21 @@ class BrainwaveIMECore:
         if self._recent_audio_cache_enabled:
             self._start_recent_audio_worker()
 
+    @property
+    def _server_connected(self) -> bool:
+        """True once the matching-turn ``connected`` ack has arrived (task 0436
+        R3-M1 SSOT). Backed by ``_server_connected_event`` so the stop path can
+        await it without a separate bool drifting out of sync.
+        """
+        return self._server_connected_event.is_set()
+
+    @_server_connected.setter
+    def _server_connected(self, value: bool) -> None:
+        if value:
+            self._server_connected_event.set()
+        else:
+            self._server_connected_event.clear()
+
     def _compute_idle_ws_age_sec(self) -> tuple[Optional[float], str]:
         if self._last_turn_completed_wall_ts is not None:
             idle_sec = max(0.0, time.time() - self._last_turn_completed_wall_ts)
@@ -311,7 +359,8 @@ class BrainwaveIMECore:
                 pass
             self.ws = None
         self.ws_connected = False
-        self._session_started = False
+        self._start_requested = False
+        self._server_connected = False
         self._ws_connected_wall_ts = None
 
     def _close_audio_stream_sync(self):
@@ -683,7 +732,8 @@ class BrainwaveIMECore:
                 pass
             self.ws = None
         self.ws_connected = False
-        self._session_started = False
+        self._start_requested = False
+        self._server_connected = False
         self._set_state(IMEState.IDLE)
 
     async def receive_messages(self):
@@ -697,7 +747,8 @@ class BrainwaveIMECore:
             self.ws_connected = False
             self.ws = None
             self._ws_connected_wall_ts = None
-            self._session_started = False
+            self._start_requested = False
+            self._server_connected = False
             self._receive_task = None
             if self.state in (IMEState.RECORDING, IMEState.PROCESSING):
                 print("[IME] Connection lost during active turn, keep local recording and retry session.")
@@ -711,7 +762,8 @@ class BrainwaveIMECore:
             self.ws_connected = False
             self.ws = None
             self._ws_connected_wall_ts = None
-            self._session_started = False
+            self._start_requested = False
+            self._server_connected = False
             self._receive_task = None
             if self.state in (IMEState.RECORDING, IMEState.PROCESSING):
                 self._start_session_task()
@@ -729,7 +781,10 @@ class BrainwaveIMECore:
         if msg_type == "status":
             status = data.get("status")
             if status == "connected":
-                self._session_started = True
+                # Matching-turn ack: the server has an active provider session,
+                # so buffered audio is now safe to upload (task 0436 S2).
+                self._server_connected = True
+                self._session_start_attempts = 0
             if status == "idle" and self.state == IMEState.PROCESSING:
                 self._last_turn_completed_ts = time.perf_counter()
                 self._last_turn_completed_wall_ts = time.time()
@@ -739,7 +794,8 @@ class BrainwaveIMECore:
                     print(f"[Perf][T{self._active_turn_id}] stop_to_response_done_ms={stop_to_response_done_ms:.1f}")
                 last_mode = self.recording_mode
                 self._archive_recent_turn_audio("completed")
-                self._session_started = False
+                self._start_requested = False
+                self._server_connected = False
                 self._set_state(IMEState.IDLE)
                 if self.transcript:
                     # 先播放声音，立即给用户反馈
@@ -776,10 +832,13 @@ class BrainwaveIMECore:
         elif msg_type == "error":
             print(f"[IME] Error: {data.get('content')}")
             if self.state == IMEState.RECORDING:
-                # Keep recording locally; retry session in background.
-                had_started_session = self._session_started
-                self._session_started = False
-                if had_started_session:
+                # Keep recording locally; retry session in background. Only alert
+                # (Basso) if we had a working connected session; a warmup/
+                # confirmation failure before the first connect retries silently.
+                had_connected_session = self._server_connected
+                self._start_requested = False
+                self._server_connected = False
+                if had_connected_session:
                     self._play_sound("Basso")
                 else:
                     print("[IME] Session warmup failed before first successful start; retrying silently.")
@@ -998,7 +1057,7 @@ class BrainwaveIMECore:
                     self._audio_buffer_samples >= self._upload_chunk_samples
                     and self.ws
                     and self.ws_connected
-                    and self._session_started
+                    and self._server_connected
                 ):
                     combined = b''.join(self.audio_buffer)
                     send_buffer = combined[:self._upload_chunk_bytes]
@@ -1042,7 +1101,9 @@ class BrainwaveIMECore:
         self.recording_mode = RecordingMode.OPTIMIZED
         prompt_mode = "optimize"
         self._session_prompt_mode = prompt_mode
-        self._session_started = False
+        self._start_requested = False
+        self._server_connected = False
+        self._session_start_attempts = 0
 
         # Play start cue first so perceived audio feedback does not lag behind state icon.
         self._play_sound("Tink")
@@ -1107,12 +1168,48 @@ class BrainwaveIMECore:
 
         self._start_session_task()
 
+    async def _give_up_session_start(self):
+        """Fail closed when the session cannot be established for this turn.
+
+        Stops accepting audio, archives the locally-buffered PCM (still intact
+        because it was never uploaded), alerts, and returns to idle so the next
+        hotkey starts fresh instead of hammering a failing session (0436 S2).
+        """
+        self._audio_consumer_paused = True
+        await self._close_audio_stream()
+        archive_path = self._archive_failed_turn_audio("session_start_exhausted")
+        if archive_path:
+            print(f"[IME] Local audio archived: {archive_path}")
+        self._archive_recent_turn_audio("session_start_exhausted")
+        self._play_sound("Basso")
+        self._set_state(IMEState.IDLE)
+
     async def _ensure_session_started(self, prompt_mode: str):
         retry_interval_sec = 0.3
         if self._force_ws_refresh_before_turn:
             self._force_ws_refresh_before_turn = False
             await self._refresh_ws_for_idle_hygiene()
-        while self.state in (IMEState.RECORDING, IMEState.PROCESSING) and not self._session_started:
+        while self.state in (IMEState.RECORDING, IMEState.PROCESSING) and not self._start_requested:
+            # Bounded backoff so a confirmation-failure loop during recording
+            # cannot become a retry storm (task 0436 S2). Attempts persist across
+            # error-triggered restarts and reset on a `connected` ack / new turn.
+            self._session_start_attempts += 1
+            if self._session_start_attempts > self._max_session_start_attempts:
+                print(
+                    f"[IME] Session start attempts exhausted "
+                    f"({self._max_session_start_attempts}); giving up this turn"
+                )
+                await self._give_up_session_start()
+                return
+            if self._session_start_attempts > 1:
+                backoff = min(
+                    self._session_start_backoff_cap_sec,
+                    self._session_start_backoff_base_sec
+                    * (2 ** (self._session_start_attempts - 2)),
+                )
+                await asyncio.sleep(backoff)
+                if self.state not in (IMEState.RECORDING, IMEState.PROCESSING):
+                    return
             if not self.ws_connected:
                 connected = await self.connect_websocket()
                 if not connected:
@@ -1127,7 +1224,7 @@ class BrainwaveIMECore:
                     "input_sample_rate": self.config.target_sample_rate,
                     "turn_id": self._active_turn_id,
                 }))
-                self._session_started = True
+                self._start_requested = True
                 return
             except Exception as exc:
                 print(f"[IME] Failed to start recording session, retrying: {exc}")
@@ -1160,22 +1257,34 @@ class BrainwaveIMECore:
             await self._audio_queue.put(None)
             await self._audio_drained.wait()
 
-        # Give session startup a last chance before declaring upload failure.
-        if not self._session_started and self._session_task and not self._session_task.done():
-            try:
-                await asyncio.wait_for(self._session_task, timeout=1.5)
-            except Exception:
-                pass
+        # Give a slow-but-legitimate session start the confirmation budget it is
+        # entitled to before declaring upload failure (task 0436 R3-M1). The old
+        # code did `wait_for(self._session_task, 1.5)`, which CANCELS a ~3s start
+        # that would have succeeded within the 5s + 5s confirmation contract, and
+        # then only polled for 1.0s — losing a whole turn of already-recorded
+        # audio. Instead poll the matching-turn `_server_connected` Event (SSOT)
+        # up to a budget-aligned deadline. This never touches the concurrently
+        # running session task, so a legitimately slow start still reaches its
+        # `connected` ack and the buffered PCM (never uploaded) is delivered
+        # below. An already-connected turn skips the wait entirely.
+        if not self._server_connected and self._stop_session_connect_deadline_sec > 0:
+            connect_deadline = time.monotonic() + self._stop_session_connect_deadline_sec
+            while (
+                not self._server_connected
+                and self.state == IMEState.PROCESSING
+                and time.monotonic() < connect_deadline
+            ):
+                await asyncio.sleep(0.05)
 
         # 发送剩余的缓冲音频
         if self.audio_buffer:
             combined = b''.join(self.audio_buffer)
-            if combined and self.ws_connected and self._session_started:
+            if combined and self.ws_connected and self._server_connected:
                 await self.ws.send(combined)
             self._clear_audio_buffer()
 
         # 立即发送停止信号（不需要额外等待，WebSocket是顺序的）
-        if self.ws_connected and self._session_started:
+        if self.ws_connected and self._server_connected:
             await self.ws.send(json.dumps({
                 "type": "stop_recording",
                 "turn_id": self._active_turn_id,
@@ -1280,7 +1389,6 @@ if HAS_RUMPS:
         ]
         PROVIDER_OPTIONS = [
             ("openai", "OpenAI"),
-            ("xai", "xAI"),
         ]
         MODEL_OPTIONS = [
             ("gpt-realtime-mini-2025-12-15", "GPT Real Time Mini"),
@@ -1579,7 +1687,8 @@ if HAS_RUMPS:
                 self.core.ws = None
                 self.core.ws_connected = False
                 self.core._ws_connected_wall_ts = None
-                self.core._session_started = False
+                self.core._start_requested = False
+                self.core._server_connected = False
                 if self.core._session_task and not self.core._session_task.done():
                     self.core._session_task.cancel()
                 self.core._session_task = None

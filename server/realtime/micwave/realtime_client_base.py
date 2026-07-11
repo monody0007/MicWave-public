@@ -1,6 +1,10 @@
 """
 Abstract base class for realtime audio-text clients.
-Provides a common interface for different providers (OpenAI, x.ai, etc.)
+
+Defines the connection / audio / handler / open-state interface shared by the
+realtime client. The only current implementation is the OpenAI Realtime client
+(``openai_realtime_client.OpenAIRealtimeAudioTextClient``); the base class stays
+abstract to keep that surface small and testable.
 """
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional

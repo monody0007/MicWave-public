@@ -16,17 +16,21 @@ from starlette.websockets import WebSocketState
 from config import (
     OPENAI_REALTIME_MODEL,
     OPENAI_REALTIME_MODALITIES,
-    XAI_API_KEY,
-    XAI_REALTIME_MODALITIES,
-    REALTIME_PROVIDER,
 )
 from audio_persistence import TurnAudioCache
 from openai_realtime_client import OpenAIRealtimeAudioTextClient
 from prompts import get_optimize_prompt
 from realtime_client_base import RealtimeClientBase
-from realtime_text_utils import StreamingHomonymCorrector, extract_text_after_marker
+from realtime_text_utils import (
+    SIMILARITY_HARD_CAP_CHARS,
+    StreamingHomonymCorrector,
+    answer_guard_fingerprint,
+    emitted_novel_material_ratio,
+    extract_text_after_marker,
+    parse_ratio_env,
+    transcription_similarity_ratio,
+)
 from transcript_merge import merge_incremental_text
-from xai_realtime_client import XAIRealtimeAudioTextClient
 
 # Configure logging
 logging.basicConfig(
@@ -82,11 +86,20 @@ class TurnSessionConfig:
     provider_init_retry_delay_sec: float
     response_finalize_timeout_sec: float
     input_transcript_grace_sec: float
+    suspicious_marker_audio_sec: float
+    suspicious_marker_emitted_chars: int
+    suspicious_input_transcript_grace_sec: float
+    input_transcript_replacement_min_ratio: float
+    input_transcript_replacement_min_delta_chars: int
     default_source_sample_rate: int
     marker_prefix: str
     max_prefix_deltas: int
     transcription_failure_rotate_threshold: int
     passthrough_without_marker: bool
+    answer_guard_min_similarity: float
+    answer_guard_novel_material_ratio: float
+    answer_guard_grace_sec: float
+    similarity_hard_cap_chars: int
 
     @classmethod
     def from_env(cls) -> "TurnSessionConfig":
@@ -114,11 +127,30 @@ class TurnSessionConfig:
             provider_init_retry_delay_sec=float_env("BRAINWAVE_PROVIDER_INIT_RETRY_DELAY_SEC", 0.5, 0.0),
             response_finalize_timeout_sec=float_env("BRAINWAVE_RESPONSE_FINALIZE_TIMEOUT_SEC", 120.0, 5.0),
             input_transcript_grace_sec=float_env("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_SEC", 1.2, 0.0),
+            suspicious_marker_audio_sec=float_env("BRAINWAVE_SUSPICIOUS_MARKER_AUDIO_SEC", 20.0, 0.0),
+            suspicious_marker_emitted_chars=int_env("BRAINWAVE_SUSPICIOUS_MARKER_EMITTED_CHARS", 120, 0),
+            suspicious_input_transcript_grace_sec=float_env("BRAINWAVE_SUSPICIOUS_INPUT_TRANSCRIPT_GRACE_SEC", 3.0, 0.0),
+            input_transcript_replacement_min_ratio=float_env("BRAINWAVE_INPUT_TRANSCRIPT_REPLACEMENT_MIN_RATIO", 1.75, 1.0),
+            input_transcript_replacement_min_delta_chars=int_env("BRAINWAVE_INPUT_TRANSCRIPT_REPLACEMENT_MIN_DELTA_CHARS", 80, 0),
             default_source_sample_rate=AudioProcessor().source_sample_rate,
             marker_prefix="下面是不改变语言的语音识别结果：\n\n",
             max_prefix_deltas=20,
             transcription_failure_rotate_threshold=2,
             passthrough_without_marker=os.getenv("BRAINWAVE_PASSTHROUGH_WITHOUT_MARKER", "0") == "1",
+            # Answer-similarity guard (task 0436 G1/M4). min_similarity<=0
+            # disables the guard. Default 0.60: a pure deletion-shaped clean-up
+            # (ratio = 2r/(1+r)) needs >57% of chars deleted to trip 0.60, so
+            # legitimate filler cleanup (~30% deletion → ~0.82) is safe, while
+            # restate-then-answer forms (~0.53/0.58) are caught. The
+            # novel-material ratio is a second signal: emitted text carrying more
+            # than this fraction of material unaligned with the transcript also
+            # flags an answer. Both fail open. grace now defaults to 1.2s so the
+            # guard can wait for the faithful transcript when it has not arrived
+            # (S1); an already-completed transcript short-circuits with no wait.
+            answer_guard_min_similarity=parse_ratio_env("BRAINWAVE_ANSWER_GUARD_MIN_SIMILARITY", 0.60),
+            answer_guard_novel_material_ratio=parse_ratio_env("BRAINWAVE_ANSWER_GUARD_NOVEL_MATERIAL_RATIO", 0.55),
+            answer_guard_grace_sec=float_env("BRAINWAVE_ANSWER_GUARD_GRACE_SEC", 1.2, 0.0),
+            similarity_hard_cap_chars=SIMILARITY_HARD_CAP_CHARS,
         )
 
 
@@ -141,7 +173,6 @@ class TurnSession:
         self._config = config
 
         self._client: Optional[RealtimeClientBase] = None
-        self._active_provider: Optional[str] = None
         self._active_model: Optional[str] = None
         self._provider_session_turns = 0
         self._provider_session_started_at: Optional[float] = None
@@ -163,13 +194,21 @@ class TurnSession:
         self._pending_audio_chunks: list[bytes] = []
         self._response_buffer: list[str] = []
         self._marker_seen = False
+        self._emitted_without_marker = False
         self._delta_counter = 0
         self._emitted_text = ""
         self._input_transcript_text = ""
         self._input_transcript_seen = False
+        self._input_transcript_completed = False
         self._homonym_corrector = StreamingHomonymCorrector()
+        self._processed_audio_bytes = 0
 
+        self._legacy_provider_warned = False
         self._closed = False
+        # Tracked finalize barrier task for the current turn (task 0436 S1 R4).
+        # response.done schedules it and returns so the provider dispatcher is
+        # not blocked waiting on a late ASR event it must itself deliver.
+        self._finalize_task: Optional[asyncio.Task] = None
         self._reset_turn_state()
 
     @staticmethod
@@ -209,28 +248,40 @@ class TurnSession:
             return text
         return _extract_from_object(data.get("item"))
 
-    @staticmethod
-    def _resolve_provider(provider: Optional[str], model: Optional[str]) -> str:
-        if provider in {"openai", "xai"}:
-            return provider
-        if model and (model.startswith("grok-") or model in {"xai", "xai-grok"}):
-            return "xai"
-        return "openai"
-
-    def _reset_turn_state(self, active_turn_id: Optional[int] = None):
+    def _reset_turn_state(
+        self,
+        active_turn_id: Optional[int] = None,
+        preserve_pending_audio: bool = False,
+    ):
+        # A finalize barrier from the previous turn must never run against this
+        # new turn's state (task 0436 S1 R4). Cancel it here; it unwinds at its
+        # next await and its captured turn token blocks any late send onto this
+        # turn.
+        finalize_task = getattr(self, "_finalize_task", None)
+        if finalize_task is not None and not finalize_task.done():
+            finalize_task.cancel()
+        self._finalize_task = None
+        # On a same-turn retry (confirmation failure) the not-yet-forwarded PCM
+        # already received for this turn must survive the reset so it is not
+        # dropped on rebuild (task 0436 S2).
+        preserved_pending = self._pending_audio_chunks if preserve_pending_audio else []
         self._active_turn_id = active_turn_id
         self._finalized = False
         self._is_recording = False
         self._turn_done = asyncio.Event()
         self._input_transcript_done = asyncio.Event()
-        self._pending_audio_chunks = []
+        self._pending_audio_chunks = preserved_pending
         self._response_buffer = []
         self._marker_seen = False
+        self._emitted_without_marker = False
         self._delta_counter = 0
         self._emitted_text = ""
         self._input_transcript_text = ""
         self._input_transcript_seen = False
+        self._input_transcript_completed = False
+        self._input_transcript_wait_timeouts = 0
         self._homonym_corrector = StreamingHomonymCorrector()
+        self._processed_audio_bytes = 0
 
     async def _send_text_payload(self, content: str):
         if content and self._websocket.client_state == WebSocketState.CONNECTED:
@@ -274,6 +325,45 @@ class TurnSession:
             logger.warning("Buffered text discarded after removing marker prefix.")
         await self._emit_text_delta(buffered_text)
         return True
+
+    def _processed_audio_duration_sec(self) -> float:
+        bytes_per_second = self._audio_processor.target_sample_rate * 2
+        if bytes_per_second <= 0:
+            return 0.0
+        return self._processed_audio_bytes / bytes_per_second
+
+    def _is_suspicious_marker_output(self, current_text: str) -> bool:
+        if not self._marker_seen:
+            return False
+        if (
+            self._config.suspicious_marker_audio_sec <= 0
+            or self._config.suspicious_marker_emitted_chars <= 0
+        ):
+            return False
+        return (
+            self._processed_audio_duration_sec() >= self._config.suspicious_marker_audio_sec
+            and len(current_text.strip()) <= self._config.suspicious_marker_emitted_chars
+        )
+
+    def _is_material_input_transcript_replacement(
+        self,
+        current_text: str,
+        fallback_text: str,
+    ) -> bool:
+        current_len = len(current_text.strip())
+        fallback_len = len(fallback_text.strip())
+        if fallback_len == 0:
+            return False
+        if current_len == 0:
+            return True
+        if fallback_text.strip() == current_text.strip():
+            return False
+        min_delta = self._config.input_transcript_replacement_min_delta_chars
+        min_ratio = self._config.input_transcript_replacement_min_ratio
+        return (
+            fallback_len >= current_len + min_delta
+            and fallback_len >= current_len * min_ratio
+        )
 
     async def _finalize_turn(self, reason: str):
         done = self._turn_done
@@ -325,7 +415,6 @@ class TurnSession:
             self._flap_cooldown_until = None
 
         if not self._client:
-            self._active_provider = None
             self._active_model = None
             self._active_turn_id = None
             self._provider_session_turns = 0
@@ -353,7 +442,6 @@ class TurnSession:
         except Exception as e:
             logger.error(f"Error closing client after {reason}: {str(e)}", exc_info=True)
         self._client = None
-        self._active_provider = None
         self._active_model = None
         self._active_turn_id = None
         self._provider_session_turns = 0
@@ -362,46 +450,30 @@ class TurnSession:
 
     async def _create_client(
         self,
-        provider: str = None,
         model: str = None,
     ) -> RealtimeClientBase:
-        """
-        Factory function to create appropriate realtime client.
-        
+        """Create the OpenAI realtime client.
+
         Args:
-            provider: Provider name ("openai" or "xai"). Defaults to REALTIME_PROVIDER config.
-            model: Model name (for OpenAI). Defaults to OPENAI_REALTIME_MODEL.
-                      For x.ai, use "xai-grok", "xai", or any model name starting with "grok-".
-        
+            model: OpenAI model name. Defaults to OPENAI_REALTIME_MODEL.
+
         Returns:
             RealtimeClientBase instance
         """
-        provider = provider or REALTIME_PROVIDER
-        
-        if provider == "xai":
-            api_key = XAI_API_KEY
-            if not api_key:
-                raise ValueError("XAI_API_KEY not set in environment variables")
-            logger.info("Creating x.ai client (text-only mode, no voice needed)")
-            return XAIRealtimeAudioTextClient(api_key)
-        else:  # default to openai
-            api_key = OPENAI_API_KEY
-            if not api_key:
-                raise ValueError("OPENAI_API_KEY not set in environment variables")
-            selected_model = model or OPENAI_REALTIME_MODEL
-            logger.info(f"Creating OpenAI client with model: {selected_model}")
-            return OpenAIRealtimeAudioTextClient(api_key, model=selected_model)
+        api_key = OPENAI_API_KEY
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not set in environment variables")
+        selected_model = model or OPENAI_REALTIME_MODEL
+        logger.info(f"Creating OpenAI client with model: {selected_model}")
+        return OpenAIRealtimeAudioTextClient(api_key, model=selected_model)
 
     async def _init_or_reuse_client(
         self,
-        provider: str = None,
         model: str = None,
-        voice: str = None,
         instructions: Optional[str] = None,
         turn_id: Optional[int] = None,
     ):
-        provider_name = provider or REALTIME_PROVIDER
-        requested_model = (model or OPENAI_REALTIME_MODEL) if provider_name == "openai" else None
+        requested_model = model or OPENAI_REALTIME_MODEL
         max_attempts = self._config.provider_init_max_attempts
         retry_delay_sec = self._config.provider_init_retry_delay_sec
 
@@ -409,7 +481,6 @@ class TurnSession:
             self._config.keep_provider_session
             and self._client
             and self._openai_ready.is_set()
-            and self._active_provider == provider_name
             and self._active_model == requested_model
             and self._client._is_ws_open()
         )
@@ -459,24 +530,17 @@ class TurnSession:
             and not transcription_failure_limit_reached
         ):
             logger.info(
-                f"Reusing existing {provider_name} realtime session"
+                "Reusing existing OpenAI realtime session"
                 + (f" ({requested_model})" if requested_model else "")
             )
             try:
-                if provider_name == "xai":
-                    await self._client.refresh_session(
-                        modalities=XAI_REALTIME_MODALITIES,
-                        instructions=instructions,
-                    )
-                else:
-                    await self._client.refresh_session(
-                        modalities=OPENAI_REALTIME_MODALITIES,
-                        instructions=instructions,
-                    )
+                await self._client.refresh_session(
+                    modalities=OPENAI_REALTIME_MODALITIES,
+                    instructions=instructions,
+                )
             except Exception as refresh_err:
                 logger.warning(
-                    "Failed to refresh reused %s session (%s). Recreating session.",
-                    provider_name,
+                    "Failed to refresh reused OpenAI session (%s). Recreating session.",
                     refresh_err,
                 )
                 try:
@@ -484,7 +548,6 @@ class TurnSession:
                 except Exception as close_err:
                     logger.error(f"Error closing client after refresh failure: {close_err}")
                 self._client = None
-                self._active_provider = None
                 self._active_model = None
                 self._provider_session_turns = 0
                 self._provider_session_started_at = None
@@ -513,73 +576,24 @@ class TurnSession:
                     except Exception as e:
                         logger.error(f"Error closing stale client: {e}")
                     self._client = None
-                    self._active_provider = None
                     self._active_model = None
                     self._provider_session_turns = 0
                     self._provider_session_started_at = None
 
-                # Create client using factory function
-                self._client = await self._create_client(provider=provider, model=model)
-                
-                # Pass appropriate modalities based on provider
-                if provider_name == "xai":
-                    await self._client.connect(
-                        modalities=XAI_REALTIME_MODALITIES,
-                        instructions=instructions,
-                    )
-                else:
-                    await self._client.connect(
-                        modalities=OPENAI_REALTIME_MODALITIES,
-                        instructions=instructions,
-                    )
-                
-                logger.info(f"Successfully connected to {provider_name} client (attempt {attempt}/{max_attempts})")
+                # Create the OpenAI realtime client
+                self._client = await self._create_client(model=model)
+
+                await self._client.connect(
+                    modalities=OPENAI_REALTIME_MODALITIES,
+                    instructions=instructions,
+                )
+
+                logger.info(f"Successfully connected to OpenAI client (attempt {attempt}/{max_attempts})")
                 
                 # Register handlers after client is initialized
-                self._client.register_handler("session.updated", lambda data: self._on_generic_event("session.updated", data))
-                self._client.register_handler("input_audio_buffer.cleared", lambda data: self._on_generic_event("input_audio_buffer.cleared", data))
-                self._client.register_handler("input_audio_buffer.speech_started", lambda data: self._on_generic_event("input_audio_buffer.speech_started", data))
-                self._client.register_handler("rate_limits.updated", lambda data: self._on_generic_event("rate_limits.updated", data))
-                self._client.register_handler("response.output_item.added", lambda data: self._on_generic_event("response.output_item.added", data))
-                self._client.register_handler("conversation.item.created", lambda data: self._on_generic_event("conversation.item.created", data))
-                self._client.register_handler("response.content_part.added", lambda data: self._on_generic_event("response.content_part.added", data))
-                self._client.register_handler("response.text.done", self._on_response_text_done)
-                self._client.register_handler("response.output_text.done", self._on_response_text_done)
-                self._client.register_handler("response.content_part.done", lambda data: self._on_generic_event("response.content_part.done", data))
-                self._client.register_handler("response.output_item.done", lambda data: self._on_generic_event("response.output_item.done", data))
-                self._client.register_handler("response.done", self._on_response_done)
-                self._client.register_handler("error", self._on_error)
-                self._client.register_handler("response.text.delta", self._on_text_delta)
-                self._client.register_handler("response.output_text.delta", self._on_text_delta)
-                # x.ai uses response.output_audio_transcript.delta instead of response.text.delta
-                self._client.register_handler("response.output_audio_transcript.delta", self._on_text_delta)
-                self._client.register_handler("response.created", self._on_response_created)
-                # x.ai specific message types
-                self._client.register_handler("input_audio_buffer.speech_stopped", lambda data: self._on_generic_event("input_audio_buffer.speech_stopped", data))
-                self._client.register_handler("input_audio_buffer.committed", lambda data: self._on_generic_event("input_audio_buffer.committed", data))
-                self._client.register_handler("conversation.item.added", lambda data: self._on_generic_event("conversation.item.added", data))
-                self._client.register_handler(
-                    "conversation.item.input_audio_transcription.delta",
-                    self._on_input_transcription_delta,
-                )
-                self._client.register_handler(
-                    "conversation.item.input_audio_transcription.completed",
-                    self._on_input_transcription_completed,
-                )
-                self._client.register_handler(
-                    "conversation.item.input_audio_transcription.failed",
-                    self._on_input_transcription_failed,
-                )
-                self._client.register_handler("response.output_audio_transcript.done", self._on_output_audio_transcript_done)
-                self._client.register_handler("response.output_audio.delta", lambda data: self._on_generic_event("response.output_audio.delta", data))
-                self._client.register_handler("response.output_audio.done", lambda data: self._on_generic_event("response.output_audio.done", data))
-                self._client.register_handler("ping", lambda data: self._on_generic_event("ping", data))
-
-                # Auto-reconnect when the provider WS drops unexpectedly
-                self._client.set_on_disconnect(self._on_provider_disconnect)
+                self._register_client_handlers(self._client)
 
                 self._openai_ready.set()  # Set ready flag after successful initialization
-                self._active_provider = provider_name
                 self._active_model = requested_model
                 self._provider_session_turns = 0
                 self._provider_session_started_at = time.time()
@@ -594,7 +608,7 @@ class TurnSession:
                 return True
             except Exception as e:
                 logger.error(
-                    f"Failed to connect to {provider_name} client "
+                    f"Failed to connect to OpenAI client "
                     f"(attempt {attempt}/{max_attempts}): {e}"
                 )
                 self._openai_ready.clear()  # Ensure flag is cleared on failure
@@ -604,7 +618,6 @@ class TurnSession:
                     except Exception as close_err:
                         logger.error(f"Error closing failed client: {close_err}")
                     self._client = None
-                    self._active_provider = None
                     self._active_model = None
                     self._provider_session_turns = 0
                     self._provider_session_started_at = None
@@ -613,12 +626,61 @@ class TurnSession:
                     continue
                 payload = {
                     "type": "error",
-                    "content": f"Failed to initialize {provider_name} realtime connection"
+                    "content": "Failed to initialize OpenAI realtime connection"
                 }
                 if turn_id is not None:
                     payload["turn_id"] = turn_id
                 await self._websocket.send_text(json.dumps(payload, ensure_ascii=False))
                 return False
+
+    def _register_client_handlers(self, client: RealtimeClientBase):
+        """Register all provider event handlers on ``client`` and wire the
+        disconnect callback. Extracted from _init_or_reuse_client so the exact
+        production handler set can be driven through the real serial dispatcher
+        (OpenAIRealtimeAudioTextClient.receive_messages) in tests (task 0436 S1
+        R4).
+        """
+        client.register_handler("session.updated", lambda data: self._on_generic_event("session.updated", data))
+        client.register_handler("input_audio_buffer.cleared", lambda data: self._on_generic_event("input_audio_buffer.cleared", data))
+        client.register_handler("input_audio_buffer.speech_started", lambda data: self._on_generic_event("input_audio_buffer.speech_started", data))
+        client.register_handler("rate_limits.updated", lambda data: self._on_generic_event("rate_limits.updated", data))
+        client.register_handler("response.output_item.added", lambda data: self._on_generic_event("response.output_item.added", data))
+        client.register_handler("conversation.item.created", lambda data: self._on_generic_event("conversation.item.created", data))
+        client.register_handler("response.content_part.added", lambda data: self._on_generic_event("response.content_part.added", data))
+        client.register_handler("response.text.done", self._on_response_text_done)
+        client.register_handler("response.output_text.done", self._on_response_text_done)
+        client.register_handler("response.content_part.done", lambda data: self._on_generic_event("response.content_part.done", data))
+        client.register_handler("response.output_item.done", lambda data: self._on_generic_event("response.output_item.done", data))
+        client.register_handler("response.done", self._on_response_done)
+        client.register_handler("error", self._on_error)
+        client.register_handler("response.text.delta", self._on_text_delta)
+        client.register_handler("response.output_text.delta", self._on_text_delta)
+        # Audio-transcript deltas route to the text handler too (unused in text-only mode)
+        client.register_handler("response.output_audio_transcript.delta", self._on_text_delta)
+        client.register_handler("response.created", self._on_response_created)
+        # Additional realtime event types
+        client.register_handler("input_audio_buffer.speech_stopped", lambda data: self._on_generic_event("input_audio_buffer.speech_stopped", data))
+        client.register_handler("input_audio_buffer.committed", lambda data: self._on_generic_event("input_audio_buffer.committed", data))
+        client.register_handler("conversation.item.added", lambda data: self._on_generic_event("conversation.item.added", data))
+        client.register_handler(
+            "conversation.item.input_audio_transcription.delta",
+            self._on_input_transcription_delta,
+        )
+        client.register_handler(
+            "conversation.item.input_audio_transcription.completed",
+            self._on_input_transcription_completed,
+        )
+        client.register_handler(
+            "conversation.item.input_audio_transcription.failed",
+            self._on_input_transcription_failed,
+        )
+        client.register_handler("response.output_audio_transcript.done", self._on_output_audio_transcript_done)
+        client.register_handler("response.output_audio.delta", lambda data: self._on_generic_event("response.output_audio.delta", data))
+        client.register_handler("response.output_audio.done", lambda data: self._on_generic_event("response.output_audio.done", data))
+        client.register_handler("ping", lambda data: self._on_generic_event("ping", data))
+
+        # Auto-reconnect when the provider WS drops unexpectedly
+        client.set_on_disconnect(self._on_provider_disconnect)
 
     async def _on_provider_disconnect(self):
         if self._finalized:
@@ -673,14 +735,13 @@ class TurnSession:
                     await self._finalize_turn("provider_disconnect_during_response")
                 return
 
-            if not self._active_provider:
-                logger.error("Provider disconnected with no active provider; finalizing turn")
+            if not self._active_model:
+                logger.error("Provider disconnected with no active session; finalizing turn")
                 await self._finalize_turn("provider_unavailable")
                 return
 
             logger.info("Recording active during disconnect; auto-reconnecting")
             ok = await self._init_or_reuse_client(
-                provider=self._active_provider,
                 model=self._active_model,
                 turn_id=self._active_turn_id,
             )
@@ -705,17 +766,17 @@ class TurnSession:
                 return
             delta = data.get("delta", "")
             logger.debug(
-                "Received text delta: %r (marker_seen=%s, buffer_size=%d, delta_counter=%d)",
-                delta[:50],
+                "Received text delta (delta_len=%d, marker_seen=%s, buffer_size=%d, delta_counter=%d)",
+                len(delta),
                 self._marker_seen,
                 len(self._response_buffer),
                 self._delta_counter,
             )
 
-            if self._marker_seen:
+            if self._marker_seen or self._emitted_without_marker:
                 if delta:
                     await self._emit_text_delta(delta)
-                    logger.debug(f"Handled response.text.delta (passthrough): {repr(delta[:50])}")
+                    logger.debug("Handled response.text.delta (passthrough, delta_len=%d)", len(delta))
                 return
 
             if not delta:
@@ -732,7 +793,8 @@ class TurnSession:
                 if remaining:
                     await self._emit_text_delta(remaining)
                 logger.debug(
-                    f"Handled response.text.delta (marker stripped), emitted: {repr(remaining[:50])}"
+                    "Handled response.text.delta (marker stripped, emitted_len=%d)",
+                    len(remaining),
                 )
                 return
 
@@ -754,11 +816,15 @@ class TurnSession:
                 buffered = "".join(self._response_buffer)
                 self._response_buffer = []
                 self._delta_counter = 0
-                self._marker_seen = True
+                # Keep streaming so we never drop words (task 0281), but do NOT
+                # fake marker_seen — flag emitted-without-marker so finalize's
+                # no-marker replacement keeps governing this path (task 0436 G3).
+                self._emitted_without_marker = True
                 if buffered:
                     await self._emit_text_delta(buffered)
                 logger.warning(
-                    "Marker prefix not detected after %d deltas; emitting as-is (len=%d).",
+                    "Marker prefix not detected after %d deltas; emitting as-is "
+                    "without marker (len=%d).",
                     self._config.max_prefix_deltas,
                     len(buffered),
                 )
@@ -787,6 +853,7 @@ class TurnSession:
             self._consecutive_transcription_failures = 0
             if completed_text and len(completed_text) >= len(self._input_transcript_text):
                 self._input_transcript_text = completed_text
+            self._input_transcript_completed = True
             logger.info(
                 "Handled conversation.item.input_audio_transcription.completed "
                 "(len=%d)",
@@ -817,38 +884,77 @@ class TurnSession:
         if self._input_transcript_done:
             self._input_transcript_done.set()
 
-    async def _apply_input_transcription_fallback(self, event_type: str):
-        if self._active_provider != "openai":
-            return
+    def _current_emitted_view(self) -> str:
+        """Full corrected text produced this turn, including the homonym
+        corrector's not-yet-sent held tail (task 0436 M6). Falls back to the
+        already-sent text when the corrector view is empty (e.g. after a
+        replacement reset it).
+        """
+        view = self._homonym_corrector.peek_full_text()
+        if view:
+            return view
+        return self._emitted_text
+
+    async def _apply_input_transcription_fallback(self, event_type: str, turn_token=None):
         done = self._input_transcript_done
-        # Only wait for input transcription when marker_seen is False
-        # (model may have answered instead of transcribing).  When the
-        # marker was seen the model followed the transcription format,
-        # so the fallback is very unlikely to be needed and we skip the
-        # grace wait to avoid adding ~1.2 s of unnecessary latency.
-        if done and not done.is_set() and self._config.input_transcript_grace_sec > 0:
-            if not self._marker_seen:
-                try:
-                    await asyncio.wait_for(
-                        done.wait(),
-                        timeout=self._config.input_transcript_grace_sec,
-                    )
-                except asyncio.TimeoutError:
-                    logger.info(
-                        "Input transcription grace wait timed out (%.2fs) on %s",
-                        self._config.input_transcript_grace_sec,
-                        event_type,
-                    )
-            else:
+        current_text = self._current_emitted_view().strip()
+        suspicious_marker_output = self._is_suspicious_marker_output(current_text)
+        answer_guard_enabled = self._config.answer_guard_min_similarity > 0
+        # Single bounded barrier before status:idle (task 0436 S1). Wait for the
+        # faithful transcript only when it may be needed and has not arrived, so
+        # a normal turn (transcript already completed) adds no perceptible
+        # latency. On timeout we fail open (no replacement) and count it.
+        grace_sec = 0.0
+        if not self._marker_seen:
+            grace_sec = self._config.input_transcript_grace_sec
+        elif suspicious_marker_output:
+            grace_sec = self._config.suspicious_input_transcript_grace_sec
+        elif answer_guard_enabled:
+            grace_sec = self._config.answer_guard_grace_sec
+
+        if done and not done.is_set() and grace_sec > 0:
+            try:
+                await asyncio.wait_for(done.wait(), timeout=grace_sec)
+            except asyncio.TimeoutError:
+                self._input_transcript_wait_timeouts += 1
                 logger.info(
-                    "Skipping input transcription grace wait (marker_seen=True) on %s",
+                    "Input transcription wait timed out (%.2fs) on %s; failing "
+                    "open without replacement (marker_seen=%s suspicious=%s "
+                    "audio_sec=%.2f timeout_count=%d)",
+                    grace_sec,
                     event_type,
+                    self._marker_seen,
+                    suspicious_marker_output,
+                    self._processed_audio_duration_sec(),
+                    self._input_transcript_wait_timeouts,
                 )
+            else:
+                logger.debug(
+                    "Input transcription completed within grace on %s "
+                    "(marker_seen=%s suspicious=%s)",
+                    event_type,
+                    self._marker_seen,
+                    suspicious_marker_output,
+                )
+        elif done and not done.is_set() and self._marker_seen:
+            logger.debug(
+                "Skipping input transcription grace wait (grace<=0) on %s "
+                "(marker_seen=True suspicious=%s)",
+                event_type,
+                suspicious_marker_output,
+            )
+
+        # A new turn may have started (start_recording → reset) while we waited
+        # on the grace barrier, or the turn may already be finalized by another
+        # path. Never apply a replacement onto a superseded/finalized turn
+        # (task 0436 S1 R4 lifecycle).
+        if self._finalized or self._is_stale_turn(turn_token):
+            return
 
         fallback_text = self._input_transcript_text.strip()
         if not fallback_text:
             return
-        current_text = self._emitted_text.strip()
+        current_text = self._current_emitted_view().strip()
 
         # When marker_seen is False the model did NOT follow the
         # transcription-only format (likely answered the user's speech
@@ -864,14 +970,108 @@ class TurnSession:
                 len(fallback_text),
             )
         elif self._marker_seen and current_text:
-            # Model followed the transcription format and produced output;
-            # trust the model over input_audio_transcription (which can
-            # return garbled text for very short utterances).
-            return
+            # Marker-following output is normally trusted. Two exceptions can
+            # still replace it with the faithful input transcription:
+            #   (a) answer-similarity guard (task 0436 G1): the emitted text
+            #       diverges materially from the completed transcript — i.e. the
+            #       model answered instead of transcribing.
+            #   (b) long-audio/short-output drift: marker present but the output
+            #       is materially shorter than the transcript.
+            answer_guard_triggered = False
+            if (
+                answer_guard_enabled
+                and self._input_transcript_completed
+                and fallback_text
+            ):
+                cap = self._config.similarity_hard_cap_chars
+                ratio = None
+                novel_ratio = None
+                try:
+                    # Run the bounded diffs off the event loop (task 0436 M5).
+                    ratio = await asyncio.to_thread(
+                        transcription_similarity_ratio,
+                        current_text, fallback_text, cap,
+                    )
+                    novel_ratio = await asyncio.to_thread(
+                        emitted_novel_material_ratio,
+                        current_text, fallback_text, cap,
+                    )
+                except Exception as guard_err:
+                    logger.error(
+                        "[answer-guard] similarity computation failed: %s", guard_err
+                    )
+                    ratio = None
+                    novel_ratio = None
+                low_similarity = (
+                    ratio is not None
+                    and ratio < self._config.answer_guard_min_similarity
+                )
+                high_novelty = (
+                    novel_ratio is not None
+                    and self._config.answer_guard_novel_material_ratio > 0
+                    and novel_ratio > self._config.answer_guard_novel_material_ratio
+                )
+                if low_similarity or high_novelty:
+                    answer_guard_triggered = True
+                    emitted_len, emitted_sha = answer_guard_fingerprint(current_text)
+                    input_len, input_sha = answer_guard_fingerprint(fallback_text)
+                    logger.warning(
+                        "[answer-guard] marker-following output flagged as answer "
+                        "(ratio=%s<%.3f=%s novel=%s>%.3f=%s); replacing "
+                        "(emitted_len=%d emitted_sha1=%s input_len=%d input_sha1=%s)",
+                        f"{ratio:.3f}" if ratio is not None else "n/a",
+                        self._config.answer_guard_min_similarity,
+                        low_similarity,
+                        f"{novel_ratio:.3f}" if novel_ratio is not None else "n/a",
+                        self._config.answer_guard_novel_material_ratio,
+                        high_novelty,
+                        emitted_len,
+                        emitted_sha,
+                        input_len,
+                        input_sha,
+                    )
+            if not answer_guard_triggered:
+                if not suspicious_marker_output:
+                    return
+                if not self._input_transcript_completed:
+                    logger.info(
+                        "Suspicious marker output fallback skipped because input "
+                        "transcription has not completed "
+                        "(fallback_len=%d current_len=%d audio_sec=%.2f)",
+                        len(fallback_text),
+                        len(current_text),
+                        self._processed_audio_duration_sec(),
+                    )
+                    return
+                if not self._is_material_input_transcript_replacement(current_text, fallback_text):
+                    logger.info(
+                        "Suspicious marker output fallback skipped because input "
+                        "transcription was not materially longer "
+                        "(fallback_len=%d current_len=%d audio_sec=%.2f)",
+                        len(fallback_text),
+                        len(current_text),
+                        self._processed_audio_duration_sec(),
+                    )
+                    return
+                logger.warning(
+                    "Suspicious marker output replaced with materially longer "
+                    "input transcription (audio_sec=%.2f emitted_len=%d fallback_len=%d)",
+                    self._processed_audio_duration_sec(),
+                    len(current_text),
+                    len(fallback_text),
+                )
         elif current_text and (
             fallback_text == current_text
             or len(fallback_text) <= len(current_text) + 1
         ):
+            return
+
+        # A concurrent _finalize_turn (reachable via a provider `error`) may have
+        # sent status:idle and cleared _active_turn_id while we awaited the
+        # answer-guard similarity diffs off the event loop above. Re-check the
+        # same lifecycle guard used before the barrier so a replacement never
+        # lands after this turn's single idle (task 0436 S1 R6 mid-guard).
+        if self._finalized or self._is_stale_turn(turn_token):
             return
 
         # About to replace the whole stream via isNewResponse=True; drop the
@@ -904,10 +1104,12 @@ class TurnSession:
             )
             self._response_buffer = []
             self._marker_seen = False
+            self._emitted_without_marker = False
             self._delta_counter = 0
             return
         self._response_buffer = []
         self._marker_seen = False
+        self._emitted_without_marker = False
         self._delta_counter = 0
         self._emitted_text = ""
         logger.info("Handled response.created, clearing buffer and resetting marker state")
@@ -925,37 +1127,101 @@ class TurnSession:
         await self._finalize_turn("error")
         logger.info("Handled error message from provider")
 
-    async def _on_text_completed(self, event_type: str, data):
+    async def _note_response_text_stream_complete(self, event_type: str, data):
+        """Record that the model's text stream is complete and flush any
+        buffered pre-marker text.
+
+        This does NOT finalize the turn. Finalization is driven solely by
+        response.done so the input-transcription replacement runs as a single
+        barrier immediately before status:idle (task 0436 S1). text.done /
+        output_text.done only record completion here.
+        """
         logger.info(
             f"Handled {event_type} "
             f"(marker_seen={self._marker_seen}, buffer_size={len(self._response_buffer)})"
         )
         if not self._marker_seen and self._emitted_text:
+            emitted_len, emitted_sha = answer_guard_fingerprint(self._emitted_text)
             logger.warning(
                 "Model output without marker prefix (possible Q&A instead of "
-                "transcription): %s",
-                repr(self._emitted_text[:120]),
+                "transcription): emitted_len=%d emitted_sha1=%s",
+                emitted_len,
+                emitted_sha,
             )
         if self._response_buffer:
             logger.info("Flushing remaining buffer content")
             flushed = await self._flush_buffer()
             if flushed:
                 self._marker_seen = True
-        await self._apply_input_transcription_fallback(event_type)
-        await self._finalize_turn(event_type)
 
     async def _on_response_done(self, data):
-        await self._on_text_completed("response.done", data)
+        # Single finalize barrier (task 0436 S1). Record text completion inline
+        # (flush the buffer if response.text.done never arrived), then hand the
+        # bounded input-transcription barrier + status:idle to a tracked finalize
+        # task and return immediately. The provider receive loop dispatches
+        # handlers serially, so awaiting the ASR barrier here would deadlock the
+        # dispatcher against the very
+        # conversation.item.input_audio_transcription.completed event the barrier
+        # waits for when that event is queued just after response.done (task 0436
+        # S1 R4). Decoupling keeps the dispatcher consuming so a late-but-within-
+        # grace ASR still drives the replacement before the single idle.
+        await self._note_response_text_stream_complete("response.done", data)
+        self._schedule_finalize("response.done")
+
+    def _is_stale_turn(self, turn_token) -> bool:
+        # A new turn (start_recording) reassigns _active_turn_id; a finalize task
+        # captured before that must not send onto the new turn (0436 S1 R4).
+        return turn_token is not None and turn_token != self._active_turn_id
+
+    def _schedule_finalize(self, reason: str):
+        """Spawn the bounded finalize barrier for the current turn exactly once.
+
+        Idempotent: if this turn is already finalized, or a finalize task is
+        already scheduled/running for it (a second terminal event, or the
+        stop_recording fallback racing response.done), no second task starts.
+        The captured turn token lets the task refuse to touch a superseded turn.
+        """
+        if self._finalized:
+            return
+        existing = self._finalize_task
+        if existing is not None and not existing.done():
+            return
+        self._finalize_task = asyncio.create_task(
+            self._finalize_after_barrier(reason, self._active_turn_id)
+        )
+
+    async def _finalize_after_barrier(self, reason: str, turn_token):
+        try:
+            if self._finalized or self._is_stale_turn(turn_token):
+                return
+            await self._apply_input_transcription_fallback(reason, turn_token=turn_token)
+            if self._finalized or self._is_stale_turn(turn_token):
+                return
+            await self._finalize_turn(reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(
+                "Error in finalize barrier (%s): %s", reason, e, exc_info=True
+            )
 
     async def _on_response_text_done(self, data):
-        await self._on_text_completed("response.text.done", data)
+        await self._note_response_text_stream_complete("response.text.done", data)
 
     async def _on_output_audio_transcript_done(self, data):
-        await self._on_text_completed("response.output_audio_transcript.done", data)
+        await self._note_response_text_stream_complete(
+            "response.output_audio_transcript.done", data
+        )
 
     async def _on_generic_event(self, event_type, data):
         if VERBOSE_SERVER_LOG:
-            logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
+            # Log only the event schema (type + top-level keys + body length),
+            # never the body itself, which can carry transcript text (0436 M8).
+            keys = sorted(data.keys()) if isinstance(data, dict) else []
+            body_len = len(json.dumps(data, ensure_ascii=False)) if data else 0
+            logger.info(
+                "Handled %s (keys=%s body_len=%d)", event_type, keys, body_len
+            )
         else:
             logger.debug(f"Handled {event_type}")
 
@@ -964,7 +1230,25 @@ class TurnSession:
         requested_turn_id = self._normalize_turn_id(msg.get("turn_id"))
         if msg.get("turn_id") is not None and requested_turn_id is None:
             logger.warning(f"Ignoring invalid turn_id from client: {msg.get('turn_id')!r}")
-        self._reset_turn_state(requested_turn_id)
+        # A same-turn start_recording is a confirmation-failure retry: keep the
+        # PCM already buffered for this turn so nothing is dropped on rebuild
+        # (task 0436 S2). A new turn wipes pending as before.
+        same_turn_retry = (
+            requested_turn_id is not None
+            and self._active_turn_id is not None
+            and requested_turn_id == self._active_turn_id
+            and not self._finalized
+        )
+        if same_turn_retry and self._pending_audio_chunks:
+            logger.info(
+                "Same-turn start_recording retry for turn %s; preserving %d "
+                "pending audio chunk(s)",
+                requested_turn_id,
+                len(self._pending_audio_chunks),
+            )
+        self._reset_turn_state(
+            requested_turn_id, preserve_pending_audio=same_turn_retry
+        )
 
         # Update status to connecting while initializing realtime client
         status_payload = {
@@ -974,17 +1258,23 @@ class TurnSession:
         if self._active_turn_id is not None:
             status_payload["turn_id"] = self._active_turn_id
         await self._websocket.send_text(json.dumps(status_payload, ensure_ascii=False))
-        # Extract provider and model from message
-        provider = msg.get("provider")  # "openai" or "xai"
+        # `provider` is accepted for backward compatibility but ignored — OpenAI
+        # is the only supported provider now (task 0436 F1). A stale value never
+        # errors or drops the connection; we just log it once per session.
+        legacy_provider = msg.get("provider")
+        if legacy_provider is not None and not self._legacy_provider_warned:
+            self._legacy_provider_warned = True
+            logger.info(
+                "Ignoring legacy 'provider' field in start_recording (=%r); "
+                "OpenAI is the only supported provider",
+                legacy_provider,
+            )
         model = msg.get("model")  # OpenAI model name
         # Optimized-only mode: use optimize prompt
         logger.info("Optimized-only mode: using optimize prompt")
         input_sample_rate = msg.get("input_sample_rate")
 
-        logger.info(f"Received start_recording: provider={provider}, model={model}")
-
-        provider = self._resolve_provider(provider, model)
-        logger.info(f"Using provider: {provider}")
+        logger.info(f"Received start_recording: model={model}")
         instructions = get_optimize_prompt()
 
         if input_sample_rate:
@@ -1001,7 +1291,6 @@ class TurnSession:
             self._audio_processor.set_source_sample_rate(self._config.default_source_sample_rate)
 
         if not await self._init_or_reuse_client(
-            provider=provider,
             model=model,
             instructions=instructions,
             turn_id=self._active_turn_id,
@@ -1060,14 +1349,9 @@ class TurnSession:
             try:
                 await self._client.commit_audio()
                 logger.info("Audio committed, starting response...")
-                # Use text-only modalities for x.ai if configured
-                if isinstance(self._client, XAIRealtimeAudioTextClient):
-                    modalities = XAI_REALTIME_MODALITIES
-                    await self._client.start_response(get_optimize_prompt(), modalities=modalities)
-                else:
-                    # OpenAI: by default rely on session-level instructions
-                    # (can be overridden via env flag on client side).
-                    await self._client.start_response(get_optimize_prompt())
+                # OpenAI: by default rely on session-level instructions
+                # (can be overridden via env flag on client side).
+                await self._client.start_response(get_optimize_prompt())
                 logger.info("Response started successfully")
             except ConnectionError as e:
                 logger.error(
@@ -1104,6 +1388,27 @@ class TurnSession:
                 )
                 await self._finalize_turn("timeout")
 
+    async def _handle_audio_bytes(self, raw: bytes):
+        """Process one inbound PCM chunk: account it, then forward or buffer.
+
+        Buffered when the provider is not ready (init/reconnect in progress) so
+        nothing is lost across a confirmation-failure rebuild; the pending
+        buffer is flushed to the provider once ready (task 0436 S2). Extracted
+        from run() so the audio path is directly testable.
+        """
+        processed_audio = self._audio_processor.process_audio_chunk(raw)
+        if self._is_recording:
+            self._processed_audio_bytes += len(processed_audio)
+            self._audio_cache.accumulate(processed_audio)
+        if not self._openai_ready.is_set():
+            logger.debug("Provider not ready, buffering audio chunk")
+            self._pending_audio_chunks.append(processed_audio)
+        elif self._client and self._is_recording:
+            await self._client.send_audio(processed_audio)
+            logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
+        else:
+            logger.debug("Received audio but client is not initialized")
+
     async def run(self):
         logger.info("receive_messages task started")
         try:
@@ -1134,18 +1439,8 @@ class TurnSession:
                     break
                 
                 if "bytes" in data:
-                    processed_audio = self._audio_processor.process_audio_chunk(data["bytes"])
-                    if self._is_recording:
-                        self._audio_cache.accumulate(processed_audio)
-                    if not self._openai_ready.is_set():
-                        logger.debug("Provider not ready, buffering audio chunk")
-                        self._pending_audio_chunks.append(processed_audio)
-                    elif self._client and self._is_recording:
-                        await self._client.send_audio(processed_audio)
-                        logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
-                    else:
-                        logger.debug("Received audio but client is not initialized")
-                            
+                    await self._handle_audio_bytes(data["bytes"])
+
                 elif "text" in data:
                     msg = json.loads(data["text"])
                     logger.debug(f"Received message from client: {msg.get('type')}")
@@ -1165,6 +1460,16 @@ class TurnSession:
         if self._closed:
             return
         self._closed = True
+        # Cancel any in-flight finalize barrier so it never sends onto a torn-down
+        # session (task 0436 S1 R4).
+        finalize_task = self._finalize_task
+        self._finalize_task = None
+        if finalize_task is not None and not finalize_task.done():
+            finalize_task.cancel()
+            try:
+                await finalize_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._client:
             try:
                 await self._client.close()

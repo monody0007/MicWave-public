@@ -7,7 +7,10 @@ from typing import Optional, Callable, Dict, List
 import asyncio
 import os
 from prompts import get_realtime_prompt
-from config import OPENAI_REALTIME_MODEL
+from config import (
+    OPENAI_REALTIME_MODEL,
+    BRAINWAVE_MAX_OUTPUT_TOKENS,
+)
 from realtime_client_base import RealtimeClientBase
 
 logger = logging.getLogger(__name__)
@@ -31,7 +34,7 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
         instructions: Optional[str] = None,
     ) -> dict:
         effective_modalities = modalities or ["text"]
-        return {
+        session: dict = {
             "type": "realtime",
             "output_modalities": effective_modalities,
             "audio": {
@@ -45,6 +48,7 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             },
             "instructions": instructions or get_realtime_prompt(),
         }
+        return session
         
     async def connect(
         self,
@@ -81,7 +85,38 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             self.ws = None
             raise
         response_data = json.loads(response)
-        if response_data["type"] == "session.created":
+        first_frame_type = response_data.get("type")
+        if first_frame_type != "session.created":
+            # Fail-closed on an unexpected first frame (task 0436 M1). Any frame
+            # other than session.created means the session was not created; do
+            # not send session config or start the receive loop — close and
+            # raise so the caller rebuilds a clean session. For an error frame we
+            # log only the redacted error type/code, never the transcript-free
+            # but potentially sensitive full body.
+            if first_frame_type == "error":
+                err = response_data.get("error", {})
+                logger.error(
+                    "OpenAI connect: first frame is an error "
+                    "(type=%s code=%s) — aborting connect",
+                    err.get("type", "unknown"),
+                    err.get("code", "unknown"),
+                )
+            else:
+                logger.error(
+                    "OpenAI connect: unexpected first frame type=%r (expected "
+                    "session.created) — aborting connect",
+                    first_frame_type,
+                )
+            try:
+                await asyncio.wait_for(self.ws.close(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            self.ws = None
+            raise RuntimeError(
+                f"OpenAI first frame was {first_frame_type!r}, not session.created"
+            )
+
+        if first_frame_type == "session.created":
             self.session_id = response_data["session"]["id"]
             logger.info(f"Session created with ID: {self.session_id}")
 
@@ -98,27 +133,114 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             }, ensure_ascii=False))
 
             # Wait for session.updated confirmation before proceeding.
-            # Without this, audio may arrive at the API before instructions
-            # are applied, causing default Q&A behaviour on the first turn.
-            try:
-                confirmation = await asyncio.wait_for(self.ws.recv(), timeout=5.0)
-                confirmation_data = json.loads(confirmation)
-                if confirmation_data.get("type") == "session.updated":
-                    logger.info("OpenAI session.updated confirmed")
-                else:
-                    logger.warning(
-                        "Expected session.updated, got %s — instructions may not be active yet. Data: %s",
-                        confirmation_data.get("type"),
-                        json.dumps(confirmation_data, ensure_ascii=False)[:500],
-                    )
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for session.updated confirmation")
+            # Without this, audio may arrive at the API before instructions are
+            # applied, causing default Q&A behaviour on the first turn (task
+            # 0436 R5). If confirmation never arrives, resend once; if it still
+            # fails, abort the connect so the caller rebuilds a clean session
+            # instead of silently recording with default (answer) behaviour.
+            confirmed = await self._recv_session_updated(timeout=5.0)
+            if not confirmed:
+                logger.warning(
+                    "session.updated not confirmed; resending session.update once"
+                )
+                await self.ws.send(json.dumps({
+                    "type": "session.update",
+                    "session": session_config_payload,
+                }, ensure_ascii=False))
+                confirmed = await self._recv_session_updated(timeout=5.0)
+            if not confirmed:
+                logger.error(
+                    "session.updated not confirmed after resend; aborting connect "
+                    "to force a clean session rebuild"
+                )
+                try:
+                    await asyncio.wait_for(self.ws.close(), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                self.ws = None
+                raise RuntimeError("OpenAI session.updated not confirmed after resend")
+            logger.info("OpenAI session.updated confirmed")
 
         # Register the default handler
         self.register_handler("default", self.default_handler)
 
         # Start the receiver coroutine
         self.receive_task = asyncio.create_task(self.receive_messages())
+
+    async def _recv_session_updated(self, timeout: float) -> bool:
+        """Read frames until session.updated arrives or timeout elapses.
+
+        Used during connect() before the receive loop starts, so frames are read
+        directly here. Interleaved non-session.updated frames are ignored; an
+        error frame short-circuits to a negative result.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return False
+            try:
+                frame = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            frame_type = frame.get("type")
+            if frame_type == "session.updated":
+                return True
+            if frame_type == "error":
+                err = frame.get("error", {}) if isinstance(frame, dict) else {}
+                logger.error(
+                    "Received error while awaiting session.updated "
+                    "(type=%s code=%s)",
+                    err.get("type", "unknown"),
+                    err.get("code", "unknown"),
+                )
+                return False
+            logger.debug("Ignoring %s while awaiting session.updated", frame_type)
+
+    async def _send_session_update_and_wait(
+        self,
+        session_config_payload: dict,
+        timeout: float,
+    ) -> bool:
+        """Send session.update and wait for session.updated via a temp handler.
+
+        The receive loop is already consuming frames, so we hook session.updated
+        with a temporary handler that sets an Event, then always restore the
+        original handler. Returns True iff confirmation arrived within timeout.
+        """
+        session_updated_event = asyncio.Event()
+        original_handler = self.handlers.get("session.updated")
+
+        async def _on_session_updated(data):
+            session_updated_event.set()
+            if original_handler:
+                self.handlers["session.updated"] = original_handler
+                await original_handler(data)
+            else:
+                self.handlers.pop("session.updated", None)
+
+        self.handlers["session.updated"] = _on_session_updated
+        try:
+            await self.ws.send(json.dumps({
+                "type": "session.update",
+                "session": session_config_payload,
+            }, ensure_ascii=False))
+            logger.info("Refreshed OpenAI session configuration via session.update")
+            await asyncio.wait_for(session_updated_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            # If the temp handler is still installed (timeout path), restore it.
+            if self.handlers.get("session.updated") is _on_session_updated:
+                if original_handler:
+                    self.handlers["session.updated"] = original_handler
+                else:
+                    self.handlers.pop("session.updated", None)
 
     async def refresh_session(
         self,
@@ -132,42 +254,27 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             modalities=modalities,
             instructions=instructions,
         )
-        # Use an Event + temporary handler to wait for session.updated,
-        # because receive_messages is already consuming from the WebSocket.
-        session_updated_event = asyncio.Event()
-        original_handler = self.handlers.get("session.updated")
+        # Wait for session.updated so instructions are active before any audio is
+        # forwarded. On timeout, resend once; if still unconfirmed, fail-closed
+        # (task 0436 R5) so the caller rebuilds the session instead of recording
+        # with default (answer) behaviour.
+        confirmed = await self._send_session_update_and_wait(
+            session_config_payload, timeout=5.0
+        )
+        if not confirmed:
+            logger.warning("session.updated not confirmed on refresh; resending once")
+            confirmed = await self._send_session_update_and_wait(
+                session_config_payload, timeout=5.0
+            )
+        if not confirmed:
+            logger.error(
+                "session.updated not confirmed after refresh resend; forcing "
+                "session rebuild"
+            )
+            raise RuntimeError("OpenAI session.updated not confirmed on refresh")
+        logger.info("OpenAI session.updated confirmed (refresh)")
 
-        async def _on_session_updated(data):
-            session_updated_event.set()
-            # Restore original handler
-            if original_handler:
-                self.handlers["session.updated"] = original_handler
-                await original_handler(data)
-            else:
-                self.handlers.pop("session.updated", None)
 
-        self.handlers["session.updated"] = _on_session_updated
-
-        await self.ws.send(json.dumps({
-            "type": "session.update",
-            "session": session_config_payload,
-        }, ensure_ascii=False))
-        logger.info("Refreshed OpenAI session configuration via session.update")
-
-        # Wait for session.updated confirmation so instructions are active
-        # before any audio is forwarded to the provider.
-        try:
-            await asyncio.wait_for(session_updated_event.wait(), timeout=5.0)
-            logger.info("OpenAI session.updated confirmed (refresh)")
-        except asyncio.TimeoutError:
-            logger.warning("Timeout waiting for session.updated after refresh")
-            # Restore handler on timeout
-            if original_handler:
-                self.handlers["session.updated"] = original_handler
-            else:
-                self.handlers.pop("session.updated", None)
-
-    
     async def send_instructions_audio(self):
         """Send the instructions.wav file as audio input to be appended to current buffer"""
         instructions_path = "instructions.wav"
@@ -247,6 +354,11 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
         }
         if self.include_instructions_each_response and instructions:
             response_config["instructions"] = instructions
+        # Optional output cap (task 0436 A2/M7). Only sent when configured and
+        # validated to [1, 4096]; unset preserves today's behaviour of relying
+        # on the API defaults. GA Realtime has no per-response temperature.
+        if BRAINWAVE_MAX_OUTPUT_TOKENS is not None:
+            response_config["max_output_tokens"] = BRAINWAVE_MAX_OUTPUT_TOKENS
 
         await self.ws.send(json.dumps({
             "type": "response.create",

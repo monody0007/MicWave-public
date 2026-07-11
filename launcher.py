@@ -154,19 +154,12 @@ def load_env():
 def preflight_check() -> bool:
     """启动前自检：验证关键配置并输出生效值摘要。返回 False 表示致命错误。"""
     ok = True
-    provider = os.getenv("REALTIME_PROVIDER", "openai")
 
     # ── 1. API key 检查 ──
-    if provider == "openai":
-        key = os.getenv("OPENAI_API_KEY", "")
-        if not key or key.startswith("your_"):
-            print("[Preflight] FATAL: OPENAI_API_KEY is missing or placeholder")
-            ok = False
-    elif provider == "xai":
-        key = os.getenv("XAI_API_KEY", "")
-        if not key or key.startswith("your_"):
-            print("[Preflight] FATAL: XAI_API_KEY is missing or placeholder")
-            ok = False
+    key = os.getenv("OPENAI_API_KEY", "")
+    if not key or key.startswith("your_"):
+        print("[Preflight] FATAL: OPENAI_API_KEY is missing or placeholder")
+        ok = False
 
     # ── 2. 关键 session 管理参数（带默认值兜底） ──
     session_params = {
@@ -194,11 +187,9 @@ def preflight_check() -> bool:
             print("[Preflight] WARNING: INCLUDE_INSTRUCTIONS_EACH_RESPONSE 未开启 — 漂移风险高")
 
     # ── 4. 其他关键参数 ──
-    print(f"[Preflight] ── Provider 配置 ──")
-    print(f"[Preflight]   REALTIME_PROVIDER = {provider}")
-    if provider == "openai":
-        print(f"[Preflight]   OPENAI_REALTIME_MODEL = {os.getenv('OPENAI_REALTIME_MODEL', 'gpt-realtime-mini-2025-12-15')}")
-        print(f"[Preflight]   OPENAI_REALTIME_MODALITIES = {os.getenv('OPENAI_REALTIME_MODALITIES', 'text')}")
+    print(f"[Preflight] ── OpenAI Realtime 配置 ──")
+    print(f"[Preflight]   OPENAI_REALTIME_MODEL = {os.getenv('OPENAI_REALTIME_MODEL', 'gpt-realtime-mini-2025-12-15')}")
+    print(f"[Preflight]   OPENAI_REALTIME_MODALITIES = {os.getenv('OPENAI_REALTIME_MODALITIES', 'text')}")
 
     if ok:
         print("[Preflight] ✓ All checks passed")
