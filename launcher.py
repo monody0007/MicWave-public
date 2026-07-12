@@ -54,11 +54,14 @@ PID_DIR = os.path.expanduser("~/Library/Application Support/Brainwave IME")
 SERVER_PID_FILE = os.path.join(PID_DIR, "server.pid")
 APP_SUPPORT_DIR = PID_DIR
 
+# Scope single-instance enforcement to THIS app's own project dir only. The bare
+# filenames (launcher.py / ime_menubar.py / realtime_server.py) are shared with
+# the WhisperWave/EchoWave prototypes; matching on them would let MicWave SIGTERM/
+# SIGKILL those prototypes whenever MicWave starts or restarts (coexistence would
+# only hold in one launch order). PROJECT_DIR is unique per app, so matching on it
+# alone keeps the kill scoped to MicWave (H5).
 _SINGLE_INSTANCE_PATTERNS = [
     PROJECT_DIR,
-    "launcher.py",
-    "ime_menubar.py",
-    "realtime_server.py",
 ]
 
 def _should_enforce_single_instance() -> bool:
