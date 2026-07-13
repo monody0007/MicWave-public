@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Brainwave IME 启动器（开发模式）
+EchoWave IME 启动器（开发模式）
 """
 
 import atexit
@@ -56,10 +56,10 @@ APP_SUPPORT_DIR = PID_DIR
 
 # Scope single-instance enforcement to THIS app's own project dir only. The bare
 # filenames (launcher.py / ime_menubar.py / realtime_server.py) are shared with
-# the WhisperWave/EchoWave prototypes; matching on them would let MicWave SIGTERM/
-# SIGKILL those prototypes whenever MicWave starts or restarts (coexistence would
+# the WhisperWave prototype; matching on them would let EchoWave SIGTERM/
+# SIGKILL that prototype whenever EchoWave starts or restarts (coexistence would
 # only hold in one launch order). PROJECT_DIR is unique per app, so matching on it
-# alone keeps the kill scoped to MicWave (H5).
+# alone keeps the kill scoped to EchoWave (H5).
 _SINGLE_INSTANCE_PATTERNS = [
     PROJECT_DIR,
 ]
@@ -104,7 +104,7 @@ def _kill_previous_processes():
     if not matches:
         return
 
-    print(f"[Launcher] Found {len(matches)} existing Brainwave processes. Stopping...")
+    print(f"[Launcher] Found {len(matches)} existing EchoWave processes. Stopping...")
     for pid, cmd in matches:
         try:
             print(f"[Launcher] Terminating PID {pid}: {cmd}")
@@ -191,7 +191,7 @@ def preflight_check() -> bool:
 
     # ── 4. 其他关键参数 ──
     print(f"[Preflight] ── OpenAI Realtime 配置 ──")
-    print(f"[Preflight]   OPENAI_REALTIME_MODEL = {os.getenv('OPENAI_REALTIME_MODEL', 'gpt-realtime-mini-2025-12-15')}")
+    print(f"[Preflight]   OPENAI_REALTIME_MODEL = {os.getenv('OPENAI_REALTIME_MODEL', 'gpt-realtime-2.1-mini')}")
     print(f"[Preflight]   OPENAI_REALTIME_MODALITIES = {os.getenv('OPENAI_REALTIME_MODALITIES', 'text')}")
 
     if ok:
@@ -260,7 +260,7 @@ def run_menubar_directly():
         traceback.print_exc()
 
 def main():
-    print("[Launcher] Starting Brainwave IME...")
+    print("[Launcher] Starting EchoWave IME...")
 
     if "--server" in sys.argv:
         load_env()

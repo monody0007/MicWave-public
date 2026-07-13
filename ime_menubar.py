@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Brainwave IME - macOS 菜单栏应用
+EchoWave IME - macOS 菜单栏应用
 在菜单栏显示状态图标，支持快捷键录音
 使用 macOS 原生 API 监听快捷键，避免 pynput 的线程问题
 """
@@ -129,7 +129,7 @@ class Config:
     channels: int = 1
     hotkey_keycode: int = 50  # ` 键的 keycode
     provider: str = "openai"
-    model: str = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini-2025-12-15")
+    model: str = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1-mini")
     stop_tail_wait_min_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MIN_MS", "150"))
     stop_tail_wait_max_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_MAX_MS", "150"))
     stop_tail_wait_guard_ms: int = int(os.getenv("BRAINWAVE_STOP_TAIL_WAIT_GUARD_MS", "20"))
@@ -1391,6 +1391,7 @@ if HAS_RUMPS:
             ("openai", "OpenAI"),
         ]
         MODEL_OPTIONS = [
+            ("gpt-realtime-2.1-mini", "GPT Realtime 2.1 Mini"),
             ("gpt-realtime-mini-2025-12-15", "GPT Real Time Mini"),
             ("gpt-realtime", "GPT Realtime"),
         ]
@@ -1557,13 +1558,13 @@ if HAS_RUMPS:
         def _show_accessibility_warning(self):
             message = (
                 "Accessibility permission is required for the hotkey. "
-                "Open System Settings > Privacy & Security > Accessibility to re-enable Brainwave IME. "
-                "If it already looks enabled, run: tccutil reset Accessibility com.brainwave.ime"
+                "Open System Settings > Privacy & Security > Accessibility to re-enable EchoWave IME. "
+                "If it already looks enabled, toggle it off and back on."
             )
             print(f"[Access] {message}")
             if HAS_RUMPS:
                 rumps.notification(
-                    "Brainwave IME",
+                    "EchoWave IME",
                     "Accessibility Required",
                     "Open System Settings > Privacy & Security > Accessibility."
                 )
@@ -1578,12 +1579,12 @@ if HAS_RUMPS:
         def _show_input_monitoring_warning(self):
             message = (
                 "Input Monitoring permission may be required for the hotkey. "
-                "Open System Settings > Privacy & Security > Input Monitoring to re-enable Brainwave IME."
+                "Open System Settings > Privacy & Security > Input Monitoring to re-enable EchoWave IME."
             )
             print(f"[Access] {message}")
             if HAS_RUMPS:
                 rumps.notification(
-                    "Brainwave IME",
+                    "EchoWave IME",
                     "Input Monitoring Required",
                     "Open System Settings > Privacy & Security > Input Monitoring."
                 )
@@ -2177,7 +2178,7 @@ def run_cli():
     asyncio.set_event_loop(loop)
     core.loop = loop
 
-    print("Brainwave IME (CLI Mode)")
+    print("EchoWave IME (CLI Mode)")
     print("Hotkey: Cmd+` (Optimized)")
     print("Press Ctrl+C to quit")
 

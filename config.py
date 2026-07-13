@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Global configuration for OpenAI realtime model
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini-2025-12-15")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1-mini")
 
 # Modalities for realtime sessions (text-only output by default)
 OPENAI_REALTIME_MODALITIES = os.getenv("OPENAI_REALTIME_MODALITIES", "text").split(",")

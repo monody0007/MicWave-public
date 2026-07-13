@@ -2,7 +2,7 @@
 
 Mirrors the IME client's recent_audio cache but lives on the realtime
 server, so deployments without the IME (e.g. browser-based clients in
-anydoor7) can still persist raw audio. MicWave IME deployments leave this
+anydoor7) can still persist raw audio. EchoWave IME deployments leave this
 disabled because the client already caches audio on the user machine.
 
 Env (read once at construction):

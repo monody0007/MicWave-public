@@ -1,5 +1,5 @@
 """
-Prompts used by Brainwave IME (optimized-only mode).
+Prompts used by EchoWave IME (optimized-only mode).
 """
 
 PROMPTS = {
