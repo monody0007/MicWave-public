@@ -171,6 +171,7 @@ class TurnSession:
         "response.text.done",
         "response.output_text.done",
         "response.output_audio_transcript.done",
+        "digital_silence",
     }
 
     def __init__(self, websocket: WebSocket, config: TurnSessionConfig):
@@ -207,6 +208,7 @@ class TurnSession:
         self._input_transcript_completed = False
         self._homonym_corrector = StreamingHomonymCorrector()
         self._processed_audio_bytes = 0
+        self._processed_audio_all_zero = True
 
         self._legacy_provider_warned = False
         self._closed = False
@@ -270,6 +272,12 @@ class TurnSession:
         # already received for this turn must survive the reset so it is not
         # dropped on rebuild (task 0436 S2).
         preserved_pending = self._pending_audio_chunks if preserve_pending_audio else []
+        preserved_processed_audio_bytes = (
+            self._processed_audio_bytes if preserve_pending_audio else 0
+        )
+        preserved_processed_audio_all_zero = (
+            self._processed_audio_all_zero if preserve_pending_audio else True
+        )
         self._active_turn_id = active_turn_id
         self._finalized = False
         self._is_recording = False
@@ -287,7 +295,8 @@ class TurnSession:
         self._input_transcript_wait_timeouts = 0
         self._no_speech_prefix_guard = StreamingNoSpeechPrefixGuard()
         self._homonym_corrector = StreamingHomonymCorrector()
-        self._processed_audio_bytes = 0
+        self._processed_audio_bytes = preserved_processed_audio_bytes
+        self._processed_audio_all_zero = preserved_processed_audio_all_zero
 
     async def _send_text_payload(self, content: str, is_new_response: bool = False):
         if content and self._websocket.client_state == WebSocketState.CONNECTED:
@@ -355,6 +364,16 @@ class TurnSession:
         if bytes_per_second <= 0:
             return 0.0
         return self._processed_audio_bytes / bytes_per_second
+
+    def _turn_is_digital_silence(self) -> bool:
+        """Whether every processed PCM16 byte in this turn is exactly zero.
+
+        The empty turn is intentionally included: unlike amplitude/VAD silence,
+        both an empty processed stream and all-zero samples are deterministic
+        evidence that there is no provider-worthy signal.
+        """
+
+        return self._processed_audio_all_zero
 
     def _is_suspicious_marker_output(self, current_text: str) -> bool:
         if not self._marker_seen:
@@ -424,6 +443,7 @@ class TurnSession:
         if (
             self._config.no_speech_guard_enabled
             and reason in self._SUCCESSFUL_FINALIZE_REASONS
+            and reason != "digital_silence"
             and emitted_is_effectively_empty
             and not self._input_transcript_text.strip()
         ):
@@ -441,7 +461,11 @@ class TurnSession:
                 self._processed_audio_bytes,
             )
         emitted_len = len(self._emitted_text.strip()) if self._emitted_text else 0
-        if emitted_len < 10 and reason in self._SUCCESSFUL_FINALIZE_REASONS:
+        if (
+            emitted_len < 10
+            and reason in self._SUCCESSFUL_FINALIZE_REASONS
+            and reason != "digital_silence"
+        ):
             logger.warning(
                 "Suspicious short transcription on finalize (%s): "
                 "emitted_text_len=%d, marker_seen=%s, input_transcript_len=%d",
@@ -1411,6 +1435,26 @@ class TurnSession:
             )
             return
 
+        if (
+            self._config.no_speech_guard_enabled
+            and not self._finalized
+            and self._is_recording
+            and self._turn_is_digital_silence()
+        ):
+            # Stop accepting audio before the first await. The all-zero verdict
+            # is made on processed PCM, so no provider commit/response is needed.
+            self._is_recording = False
+            logger.warning(
+                "Digital silence detected on stop: audio_sec=%.2f "
+                "processed_audio_bytes=%d; skipped provider commit/response "
+                "and emitted canonical placeholder",
+                self._processed_audio_duration_sec(),
+                self._processed_audio_bytes,
+            )
+            await self._send_text_payload(NO_SPEECH_PLACEHOLDER)
+            await self._finalize_turn("digital_silence")
+            return
+
         # On explicit Stop, force-commit and force-create a response, then wait for completion.
         if self._client:
             done_event = self._turn_done
@@ -1467,8 +1511,11 @@ class TurnSession:
         from run() so the audio path is directly testable.
         """
         processed_audio = self._audio_processor.process_audio_chunk(raw)
-        if self._is_recording:
+        if self._is_recording or not self._openai_ready.is_set():
             self._processed_audio_bytes += len(processed_audio)
+            if self._processed_audio_all_zero and any(processed_audio):
+                self._processed_audio_all_zero = False
+        if self._is_recording:
             self._audio_cache.accumulate(processed_audio)
         if not self._openai_ready.is_set():
             logger.debug("Provider not ready, buffering audio chunk")
