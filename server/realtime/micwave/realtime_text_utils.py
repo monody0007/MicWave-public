@@ -61,6 +61,165 @@ SIMILARITY_HARD_CAP_CHARS = _parse_positive_int_env(
 )
 
 
+NO_SPEECH_PLACEHOLDER = "（没有识别到输入）"
+NO_SPEECH_PLACEHOLDER_MAX_INNER_CHARS = 20
+_NO_SPEECH_MAX_LEADING_WHITESPACE = 20
+_NO_SPEECH_OPEN_PARENS = frozenset("（(")
+_NO_SPEECH_CLOSE_PARENS = frozenset("）)")
+_NO_SPEECH_TRAILING_PERIODS = frozenset("。．.")
+_NO_SPEECH_PLACEHOLDER_BODIES = frozenset(
+    f"{prefix}{any_word}{effective}{voice}输入"
+    for prefix in ("没有识别到", "未识别到")
+    for any_word in ("", "任何")
+    for effective in ("", "有效")
+    for voice in ("", "语音")
+)
+_NO_SPEECH_BODY_RE = "|".join(
+    re.escape(body)
+    for body in sorted(_NO_SPEECH_PLACEHOLDER_BODIES, key=len, reverse=True)
+)
+NO_SPEECH_PLACEHOLDER_PATTERN = re.compile(
+    rf"^\s*[（(](?P<body>{_NO_SPEECH_BODY_RE})[）)]"
+)
+
+
+def strip_no_speech_placeholder_prefix(text: str) -> Tuple[bool, str]:
+    """Strip one diagnostic no-speech prefix and its trailing period/space.
+
+    The match is deliberately anchored at the transcript body's first
+    non-whitespace character. It never scans or rewrites later transcript text.
+    """
+    if not text:
+        return False, text
+    match = NO_SPEECH_PLACEHOLDER_PATTERN.match(text)
+    if match is None:
+        return False, text
+    end = match.end()
+    while end < len(text):
+        char = text[end]
+        if char.isspace() or char in _NO_SPEECH_TRAILING_PERIODS:
+            end += 1
+            continue
+        break
+    return True, text[end:]
+
+
+def is_no_speech_placeholder_only(text: str) -> bool:
+    """Return True when text contains only a no-speech diagnostic variant."""
+    matched, remaining = strip_no_speech_placeholder_prefix(text)
+    return matched and not remaining.strip()
+
+
+class StreamingNoSpeechPrefixGuard:
+    """Bounded, one-shot filter for a no-speech prefix split across deltas.
+
+    Normal text passes through on its first non-whitespace character. Only a
+    leading parenthesis enters the bounded screening buffer. Once a diagnostic
+    prefix matches, the prefix plus following periods/whitespace are discarded;
+    all later body text passes through unchanged.
+    """
+
+    def __init__(
+        self,
+        max_inner_chars: int = NO_SPEECH_PLACEHOLDER_MAX_INNER_CHARS,
+        max_leading_whitespace: int = _NO_SPEECH_MAX_LEADING_WHITESPACE,
+    ):
+        self._max_inner_chars = max_inner_chars
+        self._max_leading_whitespace = max_leading_whitespace
+        self.reset()
+
+    def reset(self) -> None:
+        self._buffer = ""
+        self._done = False
+        self._discard_trailing = False
+
+    def _release_buffer(self) -> str:
+        released = self._buffer
+        self._buffer = ""
+        self._done = True
+        return released
+
+    def _consume_matched_suffix(self, text: str) -> str:
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char.isspace() or char in _NO_SPEECH_TRAILING_PERIODS:
+                index += 1
+                continue
+            break
+        if index == len(text):
+            return ""
+        self._discard_trailing = False
+        self._done = True
+        return text[index:]
+
+    def push(self, delta: str) -> str:
+        if not delta:
+            return ""
+        if self._done:
+            return delta
+        if self._discard_trailing:
+            return self._consume_matched_suffix(delta)
+
+        self._buffer += delta
+        first_content = next(
+            (index for index, char in enumerate(self._buffer) if not char.isspace()),
+            None,
+        )
+        if first_content is None:
+            if len(self._buffer) > self._max_leading_whitespace:
+                return self._release_buffer()
+            return ""
+        if first_content > self._max_leading_whitespace:
+            return self._release_buffer()
+        if self._buffer[first_content] not in _NO_SPEECH_OPEN_PARENS:
+            return self._release_buffer()
+
+        inner_start = first_content + 1
+        close_index = next(
+            (
+                index
+                for index in range(inner_start, len(self._buffer))
+                if self._buffer[index] in _NO_SPEECH_CLOSE_PARENS
+            ),
+            None,
+        )
+        if close_index is None:
+            inner = self._buffer[inner_start:]
+            if (
+                len(inner) > self._max_inner_chars
+                or not any(body.startswith(inner) for body in _NO_SPEECH_PLACEHOLDER_BODIES)
+            ):
+                return self._release_buffer()
+            return ""
+
+        inner = self._buffer[inner_start:close_index]
+        if (
+            len(inner) > self._max_inner_chars
+            or inner not in _NO_SPEECH_PLACEHOLDER_BODIES
+        ):
+            return self._release_buffer()
+
+        remainder = self._buffer[close_index + 1 :]
+        self._buffer = ""
+        self._discard_trailing = True
+        return self._consume_matched_suffix(remainder)
+
+    def flush(self) -> str:
+        """Finish screening at response end without dropping partial text."""
+        if self._done:
+            return ""
+        if self._discard_trailing:
+            self._discard_trailing = False
+            self._done = True
+            return ""
+        if not self._buffer.strip():
+            self._buffer = ""
+            self._done = True
+            return ""
+        return self._release_buffer()
+
+
 _HOMONYM_RE = re.compile(
     r'(?:克劳德|克劳得|克劳特|克勞德|克勞得|克勞特|云|cloud|cloude|clouds|cloudy|claud|claude)'
     r'[\s\-]*'

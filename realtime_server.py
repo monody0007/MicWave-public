@@ -22,11 +22,14 @@ from openai_realtime_client import OpenAIRealtimeAudioTextClient
 from prompts import get_optimize_prompt
 from realtime_client_base import RealtimeClientBase
 from realtime_text_utils import (
+    NO_SPEECH_PLACEHOLDER,
     SIMILARITY_HARD_CAP_CHARS,
     StreamingHomonymCorrector,
+    StreamingNoSpeechPrefixGuard,
     answer_guard_fingerprint,
     emitted_novel_material_ratio,
     extract_text_after_marker,
+    is_no_speech_placeholder_only,
     parse_ratio_env,
     transcription_similarity_ratio,
 )
@@ -100,6 +103,7 @@ class TurnSessionConfig:
     answer_guard_novel_material_ratio: float
     answer_guard_grace_sec: float
     similarity_hard_cap_chars: int
+    no_speech_guard_enabled: bool
 
     @classmethod
     def from_env(cls) -> "TurnSessionConfig":
@@ -151,6 +155,7 @@ class TurnSessionConfig:
             answer_guard_novel_material_ratio=parse_ratio_env("BRAINWAVE_ANSWER_GUARD_NOVEL_MATERIAL_RATIO", 0.55),
             answer_guard_grace_sec=float_env("BRAINWAVE_ANSWER_GUARD_GRACE_SEC", 1.2, 0.0),
             similarity_hard_cap_chars=SIMILARITY_HARD_CAP_CHARS,
+            no_speech_guard_enabled=os.getenv("BRAINWAVE_NO_SPEECH_GUARD", "1") == "1",
         )
 
 
@@ -280,20 +285,24 @@ class TurnSession:
         self._input_transcript_seen = False
         self._input_transcript_completed = False
         self._input_transcript_wait_timeouts = 0
+        self._no_speech_prefix_guard = StreamingNoSpeechPrefixGuard()
         self._homonym_corrector = StreamingHomonymCorrector()
         self._processed_audio_bytes = 0
 
-    async def _send_text_payload(self, content: str):
+    async def _send_text_payload(self, content: str, is_new_response: bool = False):
         if content and self._websocket.client_state == WebSocketState.CONNECTED:
             payload = {
                 "type": "text",
                 "content": content,
-                "isNewResponse": False
+                "isNewResponse": is_new_response,
             }
             if self._active_turn_id is not None:
                 payload["turn_id"] = self._active_turn_id
             await self._websocket.send_text(json.dumps(payload, ensure_ascii=False))
-            self._emitted_text = merge_incremental_text(self._emitted_text, content)
+            if is_new_response:
+                self._emitted_text = content
+            else:
+                self._emitted_text = merge_incremental_text(self._emitted_text, content)
 
     async def _emit_text_delta(self, content: str):
         safe = self._homonym_corrector.push(content)
@@ -304,6 +313,21 @@ class TurnSession:
         tail = self._homonym_corrector.flush()
         if tail:
             await self._send_text_payload(tail)
+
+    async def _emit_body_text_delta(self, content: str):
+        if not self._config.no_speech_guard_enabled:
+            await self._emit_text_delta(content)
+            return
+        safe = self._no_speech_prefix_guard.push(content)
+        if safe:
+            await self._emit_text_delta(safe)
+
+    async def _flush_no_speech_prefix_guard(self):
+        if not self._config.no_speech_guard_enabled:
+            return
+        safe = self._no_speech_prefix_guard.flush()
+        if safe:
+            await self._emit_text_delta(safe)
 
     async def _flush_buffer(self, with_warning: bool = False) -> bool:
         if not self._response_buffer:
@@ -323,7 +347,7 @@ class TurnSession:
             return False
         if with_warning and not buffered_text:
             logger.warning("Buffered text discarded after removing marker prefix.")
-        await self._emit_text_delta(buffered_text)
+        await self._emit_body_text_delta(buffered_text)
         return True
 
     def _processed_audio_duration_sec(self) -> float:
@@ -383,9 +407,39 @@ class TurnSession:
         except Exception as e:
             logger.error(f"Error enqueueing audio cache on finalize ({reason}): {e}", exc_info=True)
         try:
+            await self._flush_no_speech_prefix_guard()
+        except Exception as e:
+            logger.error(
+                f"Error flushing no-speech prefix guard on finalize ({reason}): {e}",
+                exc_info=True,
+            )
+        try:
             await self._flush_homonym_corrector()
         except Exception as e:
             logger.error(f"Error flushing homonym corrector on finalize ({reason}): {e}", exc_info=True)
+        emitted_is_placeholder_only = is_no_speech_placeholder_only(self._emitted_text)
+        emitted_is_effectively_empty = (
+            not self._emitted_text.strip() or emitted_is_placeholder_only
+        )
+        if (
+            self._config.no_speech_guard_enabled
+            and reason in self._SUCCESSFUL_FINALIZE_REASONS
+            and emitted_is_effectively_empty
+            and not self._input_transcript_text.strip()
+        ):
+            if emitted_is_placeholder_only:
+                self._homonym_corrector.reset()
+            await self._send_text_payload(
+                NO_SPEECH_PLACEHOLDER,
+                is_new_response=emitted_is_placeholder_only,
+            )
+            logger.warning(
+                "No speech recognized on successful finalize (%s): "
+                "audio_sec=%.2f processed_audio_bytes=%d; emitted canonical placeholder",
+                reason,
+                self._processed_audio_duration_sec(),
+                self._processed_audio_bytes,
+            )
         emitted_len = len(self._emitted_text.strip()) if self._emitted_text else 0
         if emitted_len < 10 and reason in self._SUCCESSFUL_FINALIZE_REASONS:
             logger.warning(
@@ -775,7 +829,10 @@ class TurnSession:
 
             if self._marker_seen or self._emitted_without_marker:
                 if delta:
-                    await self._emit_text_delta(delta)
+                    if self._marker_seen:
+                        await self._emit_body_text_delta(delta)
+                    else:
+                        await self._emit_text_delta(delta)
                     logger.debug("Handled response.text.delta (passthrough, delta_len=%d)", len(delta))
                 return
 
@@ -791,7 +848,7 @@ class TurnSession:
                 self._marker_seen = True
                 self._response_buffer = []
                 if remaining:
-                    await self._emit_text_delta(remaining)
+                    await self._emit_body_text_delta(remaining)
                 logger.debug(
                     "Handled response.text.delta (marker stripped, emitted_len=%d)",
                     len(remaining),
@@ -897,7 +954,17 @@ class TurnSession:
 
     async def _apply_input_transcription_fallback(self, event_type: str, turn_token=None):
         done = self._input_transcript_done
-        current_text = self._current_emitted_view().strip()
+
+        def current_text_for_fallback() -> str:
+            current = self._current_emitted_view().strip()
+            if (
+                self._config.no_speech_guard_enabled
+                and is_no_speech_placeholder_only(current)
+            ):
+                return ""
+            return current
+
+        current_text = current_text_for_fallback()
         suspicious_marker_output = self._is_suspicious_marker_output(current_text)
         answer_guard_enabled = self._config.answer_guard_min_similarity > 0
         # Single bounded barrier before status:idle (task 0436 S1). Wait for the
@@ -954,7 +1021,7 @@ class TurnSession:
         fallback_text = self._input_transcript_text.strip()
         if not fallback_text:
             return
-        current_text = self._current_emitted_view().strip()
+        current_text = current_text_for_fallback()
 
         # When marker_seen is False the model did NOT follow the
         # transcription-only format (likely answered the user's speech
@@ -1106,11 +1173,13 @@ class TurnSession:
             self._marker_seen = False
             self._emitted_without_marker = False
             self._delta_counter = 0
+            self._no_speech_prefix_guard.reset()
             return
         self._response_buffer = []
         self._marker_seen = False
         self._emitted_without_marker = False
         self._delta_counter = 0
+        self._no_speech_prefix_guard.reset()
         self._emitted_text = ""
         logger.info("Handled response.created, clearing buffer and resetting marker state")
 
@@ -1153,6 +1222,7 @@ class TurnSession:
             flushed = await self._flush_buffer()
             if flushed:
                 self._marker_seen = True
+        await self._flush_no_speech_prefix_guard()
 
     async def _on_response_done(self, data):
         # Single finalize barrier (task 0436 S1). Record text completion inline
