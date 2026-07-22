@@ -163,11 +163,18 @@ class TurnSessionConfig:
             answer_guard_grace_sec=float_env("BRAINWAVE_ANSWER_GUARD_GRACE_SEC", 1.2, 0.0),
             similarity_hard_cap_chars=SIMILARITY_HARD_CAP_CHARS,
             no_speech_guard_enabled=os.getenv("BRAINWAVE_NO_SPEECH_GUARD", "1") == "1",
+            # A smaller adaptive margin is more sensitive to quiet speech. W6
+            # intentionally accepts that quiet-room breathing or clothing rustle
+            # may also be treated as signal and sent to the provider.
             no_speech_floor_margin_db=float_env(
-                "BRAINWAVE_NO_SPEECH_FLOOR_MARGIN_DB", 9.0, 0.0
+                "BRAINWAVE_NO_SPEECH_FLOOR_MARGIN_DB", 4.0, 0.0
             ),
+            # Lower the absolute clamp so quiet frames can enter statistics
+            # when the adaptive floor+margin threshold is not stricter. The
+            # HB300 x p90 leg is opt-in: a non-positive HB300 threshold disables
+            # that leg, while its spectral metrics remain observable.
             no_speech_min_active_dbfs=float_env(
-                "BRAINWAVE_NO_SPEECH_MIN_ACTIVE_DBFS", -50.0, -math.inf
+                "BRAINWAVE_NO_SPEECH_MIN_ACTIVE_DBFS", -55.0, -math.inf
             ),
             no_speech_peak_floor_dbfs=float_env(
                 "BRAINWAVE_NO_SPEECH_PEAK_FLOOR_DBFS", -55.0, -math.inf
@@ -176,8 +183,9 @@ class TurnSessionConfig:
                 "BRAINWAVE_NO_SPEECH_MIN_RUN_FRAMES", 3, 1
             ),
             no_speech_hb300_min_ratio=float_env(
-                "BRAINWAVE_NO_SPEECH_HB300_MIN_RATIO", 0.22, 0.0
+                "BRAINWAVE_NO_SPEECH_HB300_MIN_RATIO", 0.0, 0.0
             ),
+            # Only participates when BRAINWAVE_NO_SPEECH_HB300_MIN_RATIO > 0.
             no_speech_nearfield_p90_dbfs=float_env(
                 "BRAINWAVE_NO_SPEECH_NEARFIELD_P90_DBFS", -26.0, -math.inf
             ),
@@ -566,7 +574,8 @@ class TurnSession:
             or peak_dbfs < self._config.no_speech_peak_floor_dbfs
             or max_active_run_frames < self._config.no_speech_min_run_frames
             or (
-                hb300_weighted_ratio
+                self._config.no_speech_hb300_min_ratio > 0.0
+                and hb300_weighted_ratio
                 < self._config.no_speech_hb300_min_ratio
                 and active_p90_dbfs
                 < self._config.no_speech_nearfield_p90_dbfs
