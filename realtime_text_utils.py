@@ -113,10 +113,12 @@ def is_no_speech_placeholder_only(text: str) -> bool:
 class StreamingNoSpeechPrefixGuard:
     """Bounded, one-shot filter for a no-speech prefix split across deltas.
 
-    Normal text passes through on its first non-whitespace character. Only a
-    leading parenthesis enters the bounded screening buffer. Once a diagnostic
-    prefix matches, the prefix plus following periods/whitespace are discarded;
-    all later body text passes through unchanged.
+    The marker owns the response's leading formatting, so extra whitespace at
+    the start of the transcript body is discarded. Normal text passes through
+    from its first non-whitespace character. Only a leading parenthesis enters
+    the bounded screening buffer. Once a diagnostic prefix matches, the prefix
+    plus following periods/whitespace are discarded; all later body text passes
+    through unchanged.
     """
 
     def __init__(
@@ -134,7 +136,7 @@ class StreamingNoSpeechPrefixGuard:
         self._discard_trailing = False
 
     def _release_buffer(self) -> str:
-        released = self._buffer
+        released = self._buffer.lstrip()
         self._buffer = ""
         self._done = True
         return released
@@ -168,7 +170,7 @@ class StreamingNoSpeechPrefixGuard:
         )
         if first_content is None:
             if len(self._buffer) > self._max_leading_whitespace:
-                return self._release_buffer()
+                self._buffer = ""
             return ""
         if first_content > self._max_leading_whitespace:
             return self._release_buffer()
