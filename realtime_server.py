@@ -108,6 +108,9 @@ class TurnSessionConfig:
     no_speech_floor_margin_db: float
     no_speech_min_active_dbfs: float
     no_speech_peak_floor_dbfs: float
+    no_speech_min_run_frames: int
+    no_speech_hb300_min_ratio: float
+    no_speech_nearfield_p90_dbfs: float
 
     @classmethod
     def from_env(cls) -> "TurnSessionConfig":
@@ -169,6 +172,15 @@ class TurnSessionConfig:
             no_speech_peak_floor_dbfs=float_env(
                 "BRAINWAVE_NO_SPEECH_PEAK_FLOOR_DBFS", -55.0, -math.inf
             ),
+            no_speech_min_run_frames=int_env(
+                "BRAINWAVE_NO_SPEECH_MIN_RUN_FRAMES", 3, 1
+            ),
+            no_speech_hb300_min_ratio=float_env(
+                "BRAINWAVE_NO_SPEECH_HB300_MIN_RATIO", 0.22, 0.0
+            ),
+            no_speech_nearfield_p90_dbfs=float_env(
+                "BRAINWAVE_NO_SPEECH_NEARFIELD_P90_DBFS", -26.0, -math.inf
+            ),
         )
 
 
@@ -179,6 +191,7 @@ class TurnSession:
     _FLAP_THRESHOLD = 3
     _FLAP_COOLDOWN_SEC = 120.0
     _NO_SPEECH_FRAME_SAMPLES = 720  # 30 ms at the processed 24 kHz rate
+    _NO_SPEECH_HANN_WINDOW = np.hanning(_NO_SPEECH_FRAME_SAMPLES)
     _PCM16_FULL_SCALE = 32768.0
     # Finite sentinel below the quietest representable non-zero PCM16 frame.
     # This keeps percentile calculation and logs deterministic for zero-RMS frames.
@@ -229,8 +242,11 @@ class TurnSession:
         self._processed_audio_bytes = 0
         self._processed_audio_all_zero = True
         self._turn_frame_rms_dbfs: list[float] = []
+        self._turn_frame_energy_total: list[float] = []
+        self._turn_frame_energy_hb300: list[float] = []
         self._turn_peak_sample_abs = 0
         self._turn_frame_carry = b""
+        self._turn_signal_verdict: Optional[str] = None
 
         self._legacy_provider_warned = False
         self._closed = False
@@ -303,11 +319,20 @@ class TurnSession:
         preserved_frame_rms_dbfs = (
             self._turn_frame_rms_dbfs if preserve_pending_audio else []
         )
+        preserved_frame_energy_total = (
+            self._turn_frame_energy_total if preserve_pending_audio else []
+        )
+        preserved_frame_energy_hb300 = (
+            self._turn_frame_energy_hb300 if preserve_pending_audio else []
+        )
         preserved_peak_sample_abs = (
             self._turn_peak_sample_abs if preserve_pending_audio else 0
         )
         preserved_frame_carry = (
             self._turn_frame_carry if preserve_pending_audio else b""
+        )
+        preserved_signal_verdict = (
+            self._turn_signal_verdict if preserve_pending_audio else None
         )
         self._active_turn_id = active_turn_id
         self._finalized = False
@@ -329,8 +354,11 @@ class TurnSession:
         self._processed_audio_bytes = preserved_processed_audio_bytes
         self._processed_audio_all_zero = preserved_processed_audio_all_zero
         self._turn_frame_rms_dbfs = preserved_frame_rms_dbfs
+        self._turn_frame_energy_total = preserved_frame_energy_total
+        self._turn_frame_energy_hb300 = preserved_frame_energy_hb300
         self._turn_peak_sample_abs = preserved_peak_sample_abs
         self._turn_frame_carry = preserved_frame_carry
+        self._turn_signal_verdict = preserved_signal_verdict
 
     async def _send_text_payload(self, content: str, is_new_response: bool = False):
         if content and self._websocket.client_state == WebSocketState.CONNECTED:
@@ -416,7 +444,7 @@ class TurnSession:
         return 20.0 * math.log10(amplitude / cls._PCM16_FULL_SCALE)
 
     def _accumulate_turn_signal_metrics(self, processed_audio: bytes):
-        """Accumulate frame RMS and peak while retaining only sub-frame carry."""
+        """Accumulate frame level/spectrum and retain only sub-frame carry."""
 
         complete_sample_bytes = len(processed_audio) - (len(processed_audio) % 2)
         if complete_sample_bytes:
@@ -435,16 +463,48 @@ class TurnSession:
             frames = np.frombuffer(
                 combined[:complete_frame_bytes], dtype=np.int16
             ).reshape(-1, self._NO_SPEECH_FRAME_SAMPLES)
+            frames_float = frames.astype(np.float64)
+            frame_rms_energy_total = np.sum(
+                np.square(frames_float), axis=1
+            )
             frame_rms = np.sqrt(
-                np.mean(np.square(frames.astype(np.float64)), axis=1)
+                frame_rms_energy_total / self._NO_SPEECH_FRAME_SAMPLES
+            )
+            # Keep W3 active-frame RMS on the original time-domain samples.
+            # Only the HB300 spectral ratio uses the precomputed Hann window.
+            windowed_frames = frames_float * self._NO_SPEECH_HANN_WINDOW
+            spectrum_power = np.square(
+                np.abs(np.fft.rfft(windowed_frames, axis=1))
+            )
+            # Convert the one-sided spectrum to full-spectrum energy before
+            # applying Parseval. With 720 samples, 300 Hz is exactly rfft bin 9.
+            spectrum_power[:, 1:-1] *= 2.0
+            hb300_bin = math.ceil(
+                300.0
+                * self._NO_SPEECH_FRAME_SAMPLES
+                / self._audio_processor.target_sample_rate
+            )
+            frame_energy_total = (
+                np.sum(spectrum_power, axis=1)
+                / self._NO_SPEECH_FRAME_SAMPLES
+            )
+            frame_energy_hb300 = (
+                np.sum(spectrum_power[:, hb300_bin:], axis=1)
+                / self._NO_SPEECH_FRAME_SAMPLES
             )
             self._turn_frame_rms_dbfs.extend(
                 self._amplitude_dbfs(float(rms)) for rms in frame_rms
             )
+            self._turn_frame_energy_total.extend(
+                float(energy) for energy in frame_energy_total
+            )
+            self._turn_frame_energy_hb300.extend(
+                float(energy) for energy in frame_energy_hb300
+            )
         self._turn_frame_carry = combined[complete_frame_bytes:]
 
     def _no_speech_signal_metrics(self) -> Optional[dict]:
-        """Return the deterministic frame-energy verdict, or None to fail open."""
+        """Return the deterministic intentional-speech verdict, or fail open."""
 
         if not self._turn_frame_rms_dbfs:
             return None
@@ -453,22 +513,113 @@ class TurnSession:
             noise_floor_dbfs + self._config.no_speech_floor_margin_db,
             self._config.no_speech_min_active_dbfs,
         )
-        active_frames = sum(
+        active_mask = [
             rms_dbfs > active_threshold_dbfs
             for rms_dbfs in self._turn_frame_rms_dbfs
+        ]
+        active_frames = sum(active_mask)
+        active_rms_dbfs = [
+            rms_dbfs
+            for rms_dbfs, is_active in zip(
+                self._turn_frame_rms_dbfs, active_mask
+            )
+            if is_active
+        ]
+        max_active_run_frames = 0
+        current_run_frames = 0
+        for is_active in active_mask:
+            if is_active:
+                current_run_frames += 1
+                max_active_run_frames = max(
+                    max_active_run_frames, current_run_frames
+                )
+            else:
+                current_run_frames = 0
+
+        active_energy_total = sum(
+            energy
+            for energy, is_active in zip(
+                self._turn_frame_energy_total, active_mask
+            )
+            if is_active
+        )
+        active_energy_hb300 = sum(
+            energy
+            for energy, is_active in zip(
+                self._turn_frame_energy_hb300, active_mask
+            )
+            if is_active
+        )
+        hb300_weighted_ratio = (
+            active_energy_hb300 / active_energy_total
+            if active_energy_total > 0.0
+            else 0.0
+        )
+        active_p90_dbfs = (
+            float(np.percentile(active_rms_dbfs, 90))
+            if active_rms_dbfs
+            else self._ZERO_RMS_DBFS
         )
         peak_dbfs = self._amplitude_dbfs(self._turn_peak_sample_abs)
+        no_speech_signal = (
+            active_frames == 0
+            or peak_dbfs < self._config.no_speech_peak_floor_dbfs
+            or max_active_run_frames < self._config.no_speech_min_run_frames
+            or (
+                hb300_weighted_ratio
+                < self._config.no_speech_hb300_min_ratio
+                and active_p90_dbfs
+                < self._config.no_speech_nearfield_p90_dbfs
+            )
+        )
         return {
             "peak_dbfs": peak_dbfs,
             "noise_floor_dbfs": noise_floor_dbfs,
             "active_threshold_dbfs": active_threshold_dbfs,
             "active_frames": active_frames,
             "total_frames": len(self._turn_frame_rms_dbfs),
-            "no_speech_signal": (
-                active_frames == 0
-                or peak_dbfs < self._config.no_speech_peak_floor_dbfs
-            ),
+            "max_active_run_frames": max_active_run_frames,
+            "hb300_weighted_ratio": hb300_weighted_ratio,
+            "active_p90_dbfs": active_p90_dbfs,
+            "no_speech_signal": no_speech_signal,
         }
+
+    def _log_turn_signal_metrics(
+        self, signal_metrics: Optional[dict], verdict: str
+    ):
+        if signal_metrics is None:
+            noise_floor_dbfs = self._ZERO_RMS_DBFS
+            active_threshold_dbfs = max(
+                noise_floor_dbfs + self._config.no_speech_floor_margin_db,
+                self._config.no_speech_min_active_dbfs,
+            )
+            signal_metrics = {
+                "peak_dbfs": self._amplitude_dbfs(
+                    self._turn_peak_sample_abs
+                ),
+                "noise_floor_dbfs": noise_floor_dbfs,
+                "active_threshold_dbfs": active_threshold_dbfs,
+                "active_frames": 0,
+                "total_frames": 0,
+                "max_active_run_frames": 0,
+                "hb300_weighted_ratio": 0.0,
+                "active_p90_dbfs": self._ZERO_RMS_DBFS,
+            }
+        logger.info(
+            "turn signal metrics: peak=%.1f floor=%.1f thr=%.1f "
+            "active=%d/%d maxrun=%d hb300w=%.3f p90act=%.1f "
+            "verdict=%s audio_sec=%.2f",
+            signal_metrics["peak_dbfs"],
+            signal_metrics["noise_floor_dbfs"],
+            signal_metrics["active_threshold_dbfs"],
+            signal_metrics["active_frames"],
+            signal_metrics["total_frames"],
+            signal_metrics["max_active_run_frames"],
+            signal_metrics["hb300_weighted_ratio"],
+            signal_metrics["active_p90_dbfs"],
+            verdict,
+            self._processed_audio_duration_sec(),
+        )
 
     def _is_suspicious_marker_output(self, current_text: str) -> bool:
         if not self._marker_seen:
@@ -531,6 +682,27 @@ class TurnSession:
             await self._flush_homonym_corrector()
         except Exception as e:
             logger.error(f"Error flushing homonym corrector on finalize ({reason}): {e}", exc_info=True)
+        forced_signal_replacement = False
+        if (
+            self._config.no_speech_guard_enabled
+            and reason in self._SUCCESSFUL_FINALIZE_REASONS
+            and reason not in {"digital_silence", "no_speech_signal"}
+            and self._turn_signal_verdict
+            in {"digital_silence", "no_speech_signal"}
+            and self._emitted_text.strip()
+        ):
+            await self._send_text_payload(
+                NO_SPEECH_PLACEHOLDER,
+                is_new_response=True,
+            )
+            forced_signal_replacement = True
+            logger.warning(
+                "Intentional-speech verdict forced canonical replacement on "
+                "successful finalize (%s): verdict=%s audio_sec=%.2f",
+                reason,
+                self._turn_signal_verdict,
+                self._processed_audio_duration_sec(),
+            )
         emitted_is_placeholder_only = is_no_speech_placeholder_only(self._emitted_text)
         emitted_is_effectively_empty = (
             not self._emitted_text.strip() or emitted_is_placeholder_only
@@ -541,6 +713,7 @@ class TurnSession:
             and reason not in {"digital_silence", "no_speech_signal"}
             and emitted_is_effectively_empty
             and not self._input_transcript_text.strip()
+            and not forced_signal_replacement
         ):
             if emitted_is_placeholder_only:
                 self._homonym_corrector.reset()
@@ -1530,12 +1703,22 @@ class TurnSession:
             )
             return
 
-        if (
-            self._config.no_speech_guard_enabled
-            and not self._finalized
-            and self._is_recording
-            and self._turn_is_digital_silence()
-        ):
+        signal_metrics = None
+        signal_verdict = "pass"
+        if not self._finalized and self._is_recording:
+            signal_metrics = self._no_speech_signal_metrics()
+            if self._config.no_speech_guard_enabled:
+                if self._turn_is_digital_silence():
+                    signal_verdict = "digital_silence"
+                elif (
+                    signal_metrics
+                    and signal_metrics["no_speech_signal"]
+                ):
+                    signal_verdict = "no_speech_signal"
+            self._turn_signal_verdict = signal_verdict
+            self._log_turn_signal_metrics(signal_metrics, signal_verdict)
+
+        if signal_verdict == "digital_silence":
             # Stop accepting audio before the first await. The all-zero verdict
             # is made on processed PCM, so no provider commit/response is needed.
             self._is_recording = False
@@ -1550,28 +1733,26 @@ class TurnSession:
             await self._finalize_turn("digital_silence")
             return
 
-        signal_metrics = None
-        if (
-            self._config.no_speech_guard_enabled
-            and not self._finalized
-            and self._is_recording
-        ):
-            signal_metrics = self._no_speech_signal_metrics()
-        if signal_metrics and signal_metrics["no_speech_signal"]:
+        if signal_verdict == "no_speech_signal":
             # The digital-silence gate above keeps its priority. This second gate
-            # handles non-zero PCM whose complete frames contain no speech-like
-            # energy change, before provider commit/response creation.
+            # handles non-zero PCM without intentional near-field speech before
+            # provider commit/response creation.
             self._is_recording = False
             logger.warning(
                 "No speech signal detected on stop: peak_dbfs=%.2f "
                 "noise_floor_dbfs=%.2f active_threshold_dbfs=%.2f "
-                "active_frames=%d total_frames=%d audio_sec=%.2f; "
+                "active_frames=%d total_frames=%d max_run_frames=%d "
+                "hb300_weighted_ratio=%.3f active_p90_dbfs=%.2f "
+                "audio_sec=%.2f; "
                 "skipped provider commit/response and emitted canonical placeholder",
                 signal_metrics["peak_dbfs"],
                 signal_metrics["noise_floor_dbfs"],
                 signal_metrics["active_threshold_dbfs"],
                 signal_metrics["active_frames"],
                 signal_metrics["total_frames"],
+                signal_metrics["max_active_run_frames"],
+                signal_metrics["hb300_weighted_ratio"],
+                signal_metrics["active_p90_dbfs"],
                 self._processed_audio_duration_sec(),
             )
             await self._send_text_payload(NO_SPEECH_PLACEHOLDER)
