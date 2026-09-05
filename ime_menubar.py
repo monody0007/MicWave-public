@@ -184,14 +184,23 @@ class BrainwaveIMECore:
         self.audio_processor = AudioProcessor(
             config.sample_rate, config.target_sample_rate
         )
-        self.pyaudio_instance = pyaudio.PyAudio()
-        self.audio_stream = None
-        self.audio_buffer = []
-        self._audio_buffer_samples = 0
         self._pyaudio_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="pyaudio",
         )
+        self._pyaudio_executor_shutdown = False
+        try:
+            self.pyaudio_instance = self._pyaudio_executor.submit(
+                pyaudio.PyAudio
+            ).result()
+        except Exception:
+            self._pyaudio_executor.shutdown(wait=True, cancel_futures=True)
+            self._pyaudio_executor_shutdown = True
+            raise
+        self._audio_rebuild_in_progress = False
+        self.audio_stream = None
+        self.audio_buffer = []
+        self._audio_buffer_samples = 0
         self._audio_queue: Optional[asyncio.Queue] = None
         self._audio_consumer_task: Optional[asyncio.Task] = None
         self._audio_drained: asyncio.Event = asyncio.Event()
@@ -248,6 +257,8 @@ class BrainwaveIMECore:
         self._ws_connected_wall_ts = None
         self._turn_id = 0
         self._active_turn_id = None
+        self._recording_generation = 0
+        self._active_recording_token = None
         self._hotkey_down_ts = None
         self._recording_started_ts = None
         self._stop_pressed_ts = None
@@ -391,6 +402,136 @@ class BrainwaveIMECore:
             self._close_audio_stream_blocking,
             stream,
         )
+
+    def _replace_pyaudio_instance_blocking(self) -> None:
+        """Replace PortAudio on its single owner thread with no live stream."""
+        self._close_audio_stream_sync()
+        old_instance = self.pyaudio_instance
+        self.pyaudio_instance = None
+        if old_instance is not None:
+            old_instance.terminate()
+        self.pyaudio_instance = pyaudio.PyAudio()
+
+    def _terminate_pyaudio_instance_blocking(self) -> None:
+        """Idempotently close the stream and terminate the current instance."""
+        self._close_audio_stream_sync()
+        instance = self.pyaudio_instance
+        self.pyaudio_instance = None
+        if instance is not None:
+            instance.terminate()
+
+    def _open_audio_stream_with_recovery_blocking(
+        self,
+        recording_token: tuple[int, int],
+        audio_callback,
+    ):
+        """Open once, rebuild PortAudio after failure, then retry once."""
+        for attempt in (1, 2):
+            if not self._recording_token_is_current(recording_token):
+                return None
+            try:
+                if self.pyaudio_instance is None:
+                    self.pyaudio_instance = pyaudio.PyAudio()
+                stream = self.pyaudio_instance.open(
+                    format=pyaudio.paInt16,
+                    channels=self.config.channels,
+                    rate=self.config.sample_rate,
+                    input=True,
+                    frames_per_buffer=self._chunk_size_frames,
+                    stream_callback=audio_callback,
+                    start=False,
+                )
+            except Exception as exc:
+                if attempt == 2:
+                    print(
+                        "[IME] Audio open failed after PortAudio rebuild "
+                        f"(attempt 2/2): {exc}"
+                    )
+                    raise
+                print(
+                    "[IME] Audio open failed (attempt 1/2), rebuilding "
+                    f"PortAudio device table: {exc}"
+                )
+                if not self._recording_token_is_current(recording_token):
+                    return None
+                self._close_audio_stream_sync()
+                if not self._recording_token_is_current(recording_token):
+                    return None
+                try:
+                    self._replace_pyaudio_instance_blocking()
+                except Exception as rebuild_exc:
+                    print(
+                        "[IME] PortAudio rebuild failed before audio open "
+                        f"(attempt 2/2): {rebuild_exc}"
+                    )
+                    raise
+                if not self._recording_token_is_current(recording_token):
+                    return None
+                continue
+
+            if not self._recording_token_is_current(recording_token):
+                self._close_audio_stream_blocking(stream)
+                return None
+            if attempt == 2:
+                print(
+                    "[IME] PortAudio rebuilt, audio stream opened on attempt 2/2"
+                )
+            return stream
+        return None
+
+    async def rebuild_audio_device_table(self) -> bool:
+        """Attempt a Restart Service refresh while capture is inactive.
+
+        ``False`` means the state guard rejected the attempt. Once an allowed
+        attempt starts, PortAudio failure is logged and treated as best-effort
+        so the websocket/backend restart can still recover independently.
+        """
+        if (
+            self.state not in (IMEState.IDLE, IMEState.DISCONNECTED)
+            or self._audio_rebuild_in_progress
+        ):
+            return False
+        self._audio_rebuild_in_progress = True
+        try:
+            loop = self.loop or asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self._pyaudio_executor,
+                self._replace_pyaudio_instance_blocking,
+            )
+            print("[IME] Restart Service PortAudio rebuild succeeded (attempt 1/1)")
+            return True
+        except Exception as exc:
+            print(
+                "[IME] Restart Service PortAudio rebuild failed "
+                f"(attempt 1/1): {exc}"
+            )
+            return True
+        finally:
+            self._audio_rebuild_in_progress = False
+
+    def _allocate_recording_token(self) -> tuple[int, int]:
+        self._recording_generation += 1
+        token = (self._recording_generation, int(self._active_turn_id))
+        self._active_recording_token = token
+        return token
+
+    def _invalidate_recording_token(self) -> None:
+        self._active_recording_token = None
+
+    def _recording_token_is_current(self, token: tuple[int, int]) -> bool:
+        return (
+            self._active_recording_token == token
+            and self._active_turn_id == token[1]
+            and self.state == IMEState.RECORDING
+        )
+
+    def _finish_abandoned_audio_start(self) -> None:
+        """Close a token-only cancellation without clobbering a real stop/new turn."""
+        if self.state != IMEState.RECORDING or self._active_recording_token is not None:
+            return
+        self._audio_consumer_paused = True
+        self._audio_drained.set()
+        self._set_state(IMEState.IDLE)
 
     def _ensure_audio_pipeline(self):
         if self._audio_queue is None:
@@ -1078,13 +1219,14 @@ class BrainwaveIMECore:
                 self._audio_queue.task_done()
 
     async def _start_recording(self):
-        if self.state not in (IMEState.IDLE,):
+        if self.state not in (IMEState.IDLE,) or self._audio_rebuild_in_progress:
             return
 
         self._ensure_audio_pipeline()
         self._turn_id += 1
         self._active_turn_id = self._turn_id
         self._current_stream_turn_id = self._active_turn_id
+        recording_token = self._allocate_recording_token()
         self._force_ws_refresh_before_turn = self._should_refresh_ws_before_turn()
         if self._force_ws_refresh_before_turn:
             idle_sec, idle_basis = self._compute_idle_ws_age_sec()
@@ -1138,29 +1280,56 @@ class BrainwaveIMECore:
                     pass
             return (None, pyaudio.paContinue)
 
-        def open_stream():
-            stream = self.pyaudio_instance.open(
-                format=pyaudio.paInt16,
-                channels=self.config.channels,
-                rate=self.config.sample_rate,
-                input=True,
-                frames_per_buffer=self._chunk_size_frames,
-                stream_callback=_audio_callback
-            )
-            stream.start_stream()
-            return stream
-
+        candidate_stream = None
         try:
-            self.audio_stream = await self.loop.run_in_executor(
+            candidate_stream = await self.loop.run_in_executor(
                 self._pyaudio_executor,
-                open_stream,
+                self._open_audio_stream_with_recovery_blocking,
+                recording_token,
+                _audio_callback,
             )
+            if candidate_stream is None:
+                self._finish_abandoned_audio_start()
+                return
+            if not self._recording_token_is_current(recording_token):
+                await self.loop.run_in_executor(
+                    self._pyaudio_executor,
+                    self._close_audio_stream_blocking,
+                    candidate_stream,
+                )
+                self._finish_abandoned_audio_start()
+                return
+            self.audio_stream = candidate_stream
+            await self.loop.run_in_executor(
+                self._pyaudio_executor,
+                candidate_stream.start_stream,
+            )
+            if not self._recording_token_is_current(recording_token):
+                if self.audio_stream is candidate_stream:
+                    self.audio_stream = None
+                await self.loop.run_in_executor(
+                    self._pyaudio_executor,
+                    self._close_audio_stream_blocking,
+                    candidate_stream,
+                )
+                self._finish_abandoned_audio_start()
+                return
             self._recording_started_ts = time.perf_counter()
             if self._hotkey_down_ts is not None:
                 hotkey_to_recording_ms = (self._recording_started_ts - self._hotkey_down_ts) * 1000
                 print(f"[Perf][T{self._active_turn_id}] hotkey_to_recording_ms={hotkey_to_recording_ms:.1f}")
         except Exception as e:
             print(f"[IME] Audio error: {e}")
+            if self.audio_stream is candidate_stream:
+                self.audio_stream = None
+            if candidate_stream is not None:
+                await self.loop.run_in_executor(
+                    self._pyaudio_executor,
+                    self._close_audio_stream_blocking,
+                    candidate_stream,
+                )
+            if self._active_recording_token == recording_token:
+                self._invalidate_recording_token()
             self._audio_consumer_paused = True
             self._audio_drained.set()
             self._set_state(IMEState.IDLE)
@@ -1175,6 +1344,7 @@ class BrainwaveIMECore:
         because it was never uploaded), alerts, and returns to idle so the next
         hotkey starts fresh instead of hammering a failing session (0436 S2).
         """
+        self._invalidate_recording_token()
         self._audio_consumer_paused = True
         await self._close_audio_stream()
         archive_path = self._archive_failed_turn_audio("session_start_exhausted")
@@ -1236,6 +1406,7 @@ class BrainwaveIMECore:
         if self.state != IMEState.RECORDING:
             return
 
+        self._invalidate_recording_token()
         self._stop_pressed_ts = time.perf_counter()
         # Ensure each processing turn starts from a clean transcript buffer.
         self.transcript = ""
@@ -1329,6 +1500,7 @@ class BrainwaveIMECore:
         pass
 
     async def _cleanup_async_resources(self):
+        self._invalidate_recording_token()
         self._audio_consumer_paused = True
         await self._close_audio_stream()
         if self._audio_consumer_task and not self._audio_consumer_task.done():
@@ -1342,6 +1514,7 @@ class BrainwaveIMECore:
         self._audio_consumer_task = None
 
     def cleanup(self):
+        self._invalidate_recording_token()
         if self.loop and self.loop.is_running():
             try:
                 future = asyncio.run_coroutine_threadsafe(
@@ -1351,9 +1524,6 @@ class BrainwaveIMECore:
                 future.result(timeout=2)
             except Exception as exc:
                 print(f"[IME] Async cleanup error: {exc}")
-                self._close_audio_stream_sync()
-        else:
-            self._close_audio_stream_sync()
         if self._recent_audio_worker:
             self._recent_audio_worker_stop.set()
             if not self._enqueue_recent_audio_task(None):
@@ -1367,8 +1537,26 @@ class BrainwaveIMECore:
                 except Exception:
                     pass
             self._recent_audio_worker.join(timeout=0.5)
-        self.pyaudio_instance.terminate()
-        self._pyaudio_executor.shutdown(wait=True, cancel_futures=True)
+        if not self._pyaudio_executor_shutdown:
+            terminate_timed_out = False
+            try:
+                self._pyaudio_executor.submit(
+                    self._terminate_pyaudio_instance_blocking
+                ).result(timeout=2)
+            except concurrent.futures.TimeoutError:
+                terminate_timed_out = True
+                print(
+                    "[IME] PortAudio terminate timed out after 2s; "
+                    "not waiting on the executor, but the audio worker thread is "
+                    "still blocked and interpreter shutdown will join it "
+                    "(ThreadPoolExecutor workers are non-daemon since Python 3.9)"
+                )
+            finally:
+                self._pyaudio_executor.shutdown(
+                    wait=not terminate_timed_out,
+                    cancel_futures=True,
+                )
+                self._pyaudio_executor_shutdown = True
 
 
 if HAS_RUMPS:
@@ -1675,14 +1863,27 @@ if HAS_RUMPS:
         def _restart_service(self, _):
             """Menu callback. Dispatch to asyncio loop, return immediately."""
             print("[App] Restart Service requested by user")
-            if self.loop:
-                self.loop.call_soon_threadsafe(
-                    lambda: asyncio.ensure_future(self._restart_service_async())
-                )
+            if (
+                self.core.state not in (IMEState.IDLE, IMEState.DISCONNECTED)
+                or not self.loop
+            ):
+                return
+            self.loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._restart_service_async())
+            )
 
         async def _restart_service_async(self):
             try:
-                await self.core._close_audio_stream()
+                if self.core.state not in (IMEState.IDLE, IMEState.DISCONNECTED):
+                    return False
+                try:
+                    if not await self.core.rebuild_audio_device_table():
+                        return False
+                except Exception as exc:
+                    print(
+                        "[App] Restart Service continuing after unexpected "
+                        f"PortAudio rebuild error: {exc}"
+                    )
                 await self.core.disconnect_websocket()
 
                 self.core.ws = None
