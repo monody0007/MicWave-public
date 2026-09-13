@@ -212,7 +212,7 @@ def test_websocket_wire_loggers_stay_suppressed_under_app_debug():
 
 def test_turn_audio_segment_limit_defaults_to_300s_and_keeps_env_override(monkeypatch):
     monkeypatch.delenv("WHISPERWAVE_MAX_TURN_AUDIO_BYTES", raising=False)
-    assert TranscriptionTurnSessionConfig.from_env().max_turn_audio_bytes == 14_400_000
+    assert TranscriptionTurnSessionConfig.from_env().max_turn_audio_bytes == 86_400_000
 
     monkeypatch.setenv("WHISPERWAVE_MAX_TURN_AUDIO_BYTES", "48000")
     assert TranscriptionTurnSessionConfig.from_env().max_turn_audio_bytes == 48_000

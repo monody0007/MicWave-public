@@ -1265,10 +1265,17 @@ class BrainwaveIMECore:
         elif msg_type == "text":
             content = data.get("content", "")
             is_new = data.get("isNewResponse", False)
-            if is_new and self.state not in (IMEState.RECORDING, IMEState.PROCESSING):
+            if is_new and self.state not in (
+                IMEState.RECORDING, IMEState.PROCESSING
+            ):
                 print(f"[IME] Dropping reset text while state={self.state.value}")
                 return
-            if not is_new and self.state != IMEState.PROCESSING:
+            # Segment rollover (300s boundary) streams provider deltas while
+            # the turn is still RECORDING locally; dropping them lost the
+            # pre-rollover transcript on long recordings (2026-09-13 T31).
+            if not is_new and self.state not in (
+                IMEState.RECORDING, IMEState.PROCESSING
+            ):
                 print(f"[IME] Dropping text delta while state={self.state.value}")
                 return
             if is_new:

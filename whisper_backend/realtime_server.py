@@ -124,8 +124,9 @@ class TranscriptionTurnSessionConfig:
     transcription_ack_grace_sec: float
     transcription_failure_rotate_threshold: int
     default_source_sample_rate: int
-    # 300s PCM16/24k segment boundary. Reaching it commits the current segment
-    # instead of terminating the turn; the bound remains the replay-memory guard.
+    # Segment boundary (default 14400000 = 300s PCM16/24k). Reaching it commits
+    # the current segment instead of terminating the turn; the bound remains the
+    # replay-memory guard. Env-overridable for very long single turns.
     max_turn_audio_bytes: int = 14_400_000
     force_reconnect_after_ms: int = 0
 
@@ -163,7 +164,9 @@ class TranscriptionTurnSessionConfig:
             transcription_ack_grace_sec=float_env("WHISPERWAVE_TRANSCRIPTION_ACK_GRACE_SEC", 2.0, 0.0),
             transcription_failure_rotate_threshold=int_env("WHISPERWAVE_TRANSCRIPTION_FAILURE_ROTATE_THRESHOLD", 2, 1),
             default_source_sample_rate=AudioProcessor().source_sample_rate,
-            max_turn_audio_bytes=int_env("WHISPERWAVE_MAX_TURN_AUDIO_BYTES", 14_400_000, 48_000),
+            max_turn_audio_bytes=int_env(
+                "WHISPERWAVE_MAX_TURN_AUDIO_BYTES", 86_400_000, 48_000
+            ),
             force_reconnect_after_ms=int_env("WHISPERWAVE_FORCE_RECONNECT_AFTER_MS", 0, 0),
         )
 

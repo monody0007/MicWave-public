@@ -1428,3 +1428,49 @@ async def test_switch_barrier_rejects_reconnect_restart_and_stale_lifecycle_even
     app.core.state = IMEState.PROCESSING
     assert await app._restart_service_async(restart_token) is False
     assert app._active_lifecycle_operation is None
+
+
+@pytest.mark.asyncio
+async def test_recording_state_accepts_streaming_deltas_after_segment_rollover():
+    """300s segment rollover streams provider deltas while the IME turn is
+    still RECORDING locally; dropping them lost the pre-rollover transcript
+    on long recordings (2026-09-13 T31 regression)."""
+
+    core = BrainwaveIMECore.__new__(BrainwaveIMECore)
+    core._connection_generation = 1
+    core.state = IMEState.RECORDING
+    core._active_turn_id = 31
+    core._terminal_turn_ids = set()
+    core._failed_turn_ids = set()
+    core.transcript = "rollover前已提交文本"
+    core.on_transcript = None
+
+    # is_new baseline (rollover display reset) lands while RECORDING
+    await core._handle_message(
+        {
+            "type": "text",
+            "content": "rollover前已提交文本",
+            "isNewResponse": True,
+            "turn_id": 31,
+        },
+        connection_generation=1,
+    )
+    assert core.transcript == "rollover前已提交文本"
+
+    # post-rollover streaming deltas must NOT be dropped while RECORDING
+    await core._handle_message(
+        {"type": "text", "content": "rollover", "turn_id": 31},
+        connection_generation=1,
+    )
+    await core._handle_message(
+        {"type": "text", "content": "后段", "turn_id": 31},
+        connection_generation=1,
+    )
+    assert core.transcript == "rollover前已提交文本rollover后段"
+
+    # unrelated turn deltas still ignored
+    await core._handle_message(
+        {"type": "text", "content": "X", "turn_id": 32},
+        connection_generation=1,
+    )
+    assert core.transcript == "rollover前已提交文本rollover后段"
