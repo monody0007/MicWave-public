@@ -111,6 +111,13 @@ class TurnSessionConfig:
     no_speech_min_run_frames: int
     no_speech_hb300_min_ratio: float
     no_speech_nearfield_p90_dbfs: float
+    # Input-transcript grace scales with the turn's audio length (task 0809):
+    # the completed gpt-4o-transcribe event for a long recording lands seconds
+    # after response.done (465s audio -> 6.1s late, 2026-09-24), so a flat 1.2s
+    # grace dropped it. Applies to the no-marker and suspicious-marker waits;
+    # effective grace = min(max(cap, base), base + per_audio * audio_sec).
+    input_transcript_grace_per_audio_sec: float = 0.03
+    input_transcript_grace_max_sec: float = 30.0
 
     @classmethod
     def from_env(cls) -> "TurnSessionConfig":
@@ -141,6 +148,8 @@ class TurnSessionConfig:
             suspicious_marker_audio_sec=float_env("BRAINWAVE_SUSPICIOUS_MARKER_AUDIO_SEC", 20.0, 0.0),
             suspicious_marker_emitted_chars=int_env("BRAINWAVE_SUSPICIOUS_MARKER_EMITTED_CHARS", 120, 0),
             suspicious_input_transcript_grace_sec=float_env("BRAINWAVE_SUSPICIOUS_INPUT_TRANSCRIPT_GRACE_SEC", 3.0, 0.0),
+            input_transcript_grace_per_audio_sec=float_env("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_PER_AUDIO_SEC", 0.03, 0.0),
+            input_transcript_grace_max_sec=float_env("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_MAX_SEC", 30.0, 0.0),
             input_transcript_replacement_min_ratio=float_env("BRAINWAVE_INPUT_TRANSCRIPT_REPLACEMENT_MIN_RATIO", 1.75, 1.0),
             input_transcript_replacement_min_delta_chars=int_env("BRAINWAVE_INPUT_TRANSCRIPT_REPLACEMENT_MIN_DELTA_CHARS", 80, 0),
             default_source_sample_rate=AudioProcessor().source_sample_rate,
@@ -434,6 +443,19 @@ class TurnSession:
         if bytes_per_second <= 0:
             return 0.0
         return self._processed_audio_bytes / bytes_per_second
+
+    def _scaled_input_transcript_grace_sec(self, base_sec: float) -> float:
+        """Grace for the completed input transcript, grown with audio length.
+
+        base + per_audio * audio_sec, capped at max(cap, base) so the cap never
+        shortens an explicitly configured base. base <= 0 keeps its existing
+        meaning (wait disabled). Short turns stay ~= base (5s -> +0.15s).
+        """
+        if base_sec <= 0:
+            return 0.0
+        audio_sec = max(0.0, self._processed_audio_duration_sec())
+        scaled = base_sec + self._config.input_transcript_grace_per_audio_sec * audio_sec
+        return min(max(self._config.input_transcript_grace_max_sec, base_sec), scaled)
 
     def _turn_is_digital_silence(self) -> bool:
         """Whether every processed PCM16 byte in this turn is exactly zero.
@@ -1274,9 +1296,13 @@ class TurnSession:
         # latency. On timeout we fail open (no replacement) and count it.
         grace_sec = 0.0
         if not self._marker_seen:
-            grace_sec = self._config.input_transcript_grace_sec
+            grace_sec = self._scaled_input_transcript_grace_sec(
+                self._config.input_transcript_grace_sec
+            )
         elif suspicious_marker_output:
-            grace_sec = self._config.suspicious_input_transcript_grace_sec
+            grace_sec = self._scaled_input_transcript_grace_sec(
+                self._config.suspicious_input_transcript_grace_sec
+            )
         elif answer_guard_enabled:
             grace_sec = self._config.answer_guard_grace_sec
 
@@ -1285,15 +1311,20 @@ class TurnSession:
                 await asyncio.wait_for(done.wait(), timeout=grace_sec)
             except asyncio.TimeoutError:
                 self._input_transcript_wait_timeouts += 1
+                # Past this point the transcript is not completed, so a
+                # non-empty model output is kept (fail open); only an empty
+                # output can still be filled from the partial transcript.
                 logger.info(
-                    "Input transcription wait timed out (%.2fs) on %s; failing "
-                    "open without replacement (marker_seen=%s suspicious=%s "
-                    "audio_sec=%.2f timeout_count=%d)",
+                    "Input transcription wait timed out (%.2fs) on %s; completed "
+                    "transcript unavailable, failing open to non-empty model "
+                    "output (marker_seen=%s suspicious=%s audio_sec=%.2f "
+                    "partial_len=%d timeout_count=%d)",
                     grace_sec,
                     event_type,
                     self._marker_seen,
                     suspicious_marker_output,
                     self._processed_audio_duration_sec(),
+                    len(self._input_transcript_text.strip()),
                     self._input_transcript_wait_timeouts,
                 )
             else:
@@ -1326,10 +1357,22 @@ class TurnSession:
 
         # When marker_seen is False the model did NOT follow the
         # transcription-only format (likely answered the user's speech
-        # instead of transcribing it).  In that case, unconditionally
-        # replace the emitted text with the input transcription from
-        # gpt-4o-transcribe, which is always a faithful transcription.
+        # instead of transcribing it).  In that case replace the emitted text
+        # with the COMPLETED input transcription from gpt-4o-transcribe, which
+        # is a faithful transcription. Delta-accumulated text is only a prefix
+        # of the recording, so it never replaces non-empty model output: keep
+        # the model output (fail open) instead (task 0809: a 465s turn lost
+        # 969 of 1760 chars to a 791-char partial).
         if not self._marker_seen and current_text:
+            if not self._input_transcript_completed:
+                logger.warning(
+                    "Marker not seen — kept model output; input transcript "
+                    "incomplete (partial_len=%d emitted_len=%d audio_sec=%.2f)",
+                    len(fallback_text),
+                    len(current_text),
+                    self._processed_audio_duration_sec(),
+                )
+                return
             logger.warning(
                 "Marker not seen — model likely answered instead of "
                 "transcribing. Replacing emitted text with input "
