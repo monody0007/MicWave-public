@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Optional, Callable, Dict, List
 import asyncio
+import itertools
 import os
 from prompts import get_realtime_prompt
 from config import (
@@ -15,6 +16,35 @@ from realtime_client_base import RealtimeClientBase
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# How long commit_audio() waits for input_audio_buffer.committed. The ack only
+# needs the provider to drain the already-sent appends, so it is far below any
+# turn budget; missing it means the session is unusable for this turn.
+COMMIT_ACK_TIMEOUT_SEC = 15.0
+
+# response.metadata key that ties an out-of-band response back to the audio
+# item it transcribes (task 1082), so response.done can be matched to its item.
+TURN_ITEM_METADATA_KEY = "turn_item_id"
+
+# Completion signals a committed turn item waits for before it is deleted from
+# the provider conversation: our response finished, and the per-item input
+# transcription finished (completed or failed). Deleting earlier could cut off
+# the faithful input transcript the servers wait for after response.done.
+_ITEM_DONE_SIGNALS = frozenset({"response", "transcript"})
+
+
+class CommitNotAcknowledgedError(RuntimeError):
+    """input_audio_buffer.committed did not arrive for this turn's commit."""
+
+
+class TurnIsolationBrokenError(RuntimeError):
+    """An earlier commit on this session failed; the session must be recreated.
+
+    The provider's committed ack carries no reference to the client commit, so
+    after a lost or rejected commit a late ack could be mistaken for the next
+    turn's item. Rather than guess, the client refuses further turns.
+    """
+
 
 class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
     def __init__(self, api_key: str, model: str = OPENAI_REALTIME_MODEL):
@@ -27,6 +57,20 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             os.getenv("BRAINWAVE_INCLUDE_INSTRUCTIONS_EACH_RESPONSE", "1") == "1"
         )
         self._last_send_error_log: float = 0
+        # Turn isolation on reused sessions (task 1082). Every committed user
+        # audio item stays in the provider's default conversation; a plain
+        # response.create would read all of them. Each response is therefore
+        # created out-of-band with input = [this turn's item] only, and the item
+        # is deleted once the turn is done (hygiene, not correctness).
+        self._event_ids = itertools.count(1)
+        self._commit_waiter: Optional[tuple] = None  # (event_id, Future[item_id])
+        self._turn_item_id: Optional[str] = None
+        # Item bound by the current commit's ack; set inside the receive loop so
+        # handlers dispatched right after the ack can match events by item_id.
+        self.committed_item_id: Optional[str] = None
+        self._turn_isolation_broken = False
+        self._pending_item_signals: Dict[str, set] = {}
+        self._delete_event_ids: Dict[str, str] = {}  # event_id -> item_id
 
     def _build_session_config(
         self,
@@ -298,20 +342,129 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             async for message in self.ws:
                 data = json.loads(message)
                 message_type = data.get("type", "default")
+                if self._consume_hygiene_event(message_type, data):
+                    continue
                 handler = self.handlers.get(message_type, self.handlers.get("default"))
                 if handler:
                     await handler(data)
                 else:
                     logger.warning(f"No handler for message type: {message_type}")
+                # After dispatch, so server handlers see an event (e.g. the input
+                # transcript) before the client acts on it (e.g. deletes the item).
+                await self._track_turn_event(message_type, data)
         except websockets.exceptions.ConnectionClosed as e:
             logger.error(f"OpenAI WebSocket connection closed: {e}")
         except asyncio.CancelledError:
             logger.info("OpenAI receive_messages task cancelled")
+            self._fail_commit_waiter(ConnectionError("OpenAI receive loop cancelled"))
             return  # don't fire on_disconnect for intentional cancellation
         except Exception as e:
             logger.error(f"Error in receive_messages: {e}", exc_info=True)
+        self._fail_commit_waiter(ConnectionError("OpenAI WebSocket connection closed"))
         # Connection dropped unexpectedly — notify the server
         await self._fire_on_disconnect()
+
+    def _next_event_id(self, prefix: str) -> str:
+        return f"{prefix}_{next(self._event_ids)}"
+
+    def _fail_commit_waiter(self, exc: BaseException):
+        if self._commit_waiter is not None:
+            _, future = self._commit_waiter
+            if not future.done():
+                future.set_exception(exc)
+
+    def _consume_hygiene_event(self, message_type: str, data: dict) -> bool:
+        """Swallow provider replies to the client's own item deletes.
+
+        A failed delete must not reach the server's ``error`` handler: both
+        servers treat any error as a failed turn, while a leftover item cannot
+        affect results (responses only reference their own item).
+        """
+        if message_type == "error":
+            err = data.get("error") or {}
+            item_id = self._delete_event_ids.pop(err.get("event_id"), None)
+            if item_id is None:
+                return False
+            logger.warning(
+                "conversation.item.delete failed for %s (type=%s code=%s); "
+                "ignored, responses never reference earlier items",
+                item_id,
+                err.get("type", "unknown"),
+                err.get("code", "unknown"),
+            )
+            return True
+        if message_type == "conversation.item.deleted":
+            item_id = data.get("item_id")
+            for event_id in [e for e, i in self._delete_event_ids.items() if i == item_id]:
+                del self._delete_event_ids[event_id]
+            logger.debug("conversation.item.deleted %s", item_id)
+            return message_type not in self.handlers
+        return False
+
+    async def _track_turn_event(self, message_type: str, data: dict):
+        """Bookkeeping for turn items: commit acks and item completion."""
+        if message_type == "input_audio_buffer.committed":
+            item_id = data.get("item_id")
+            if not item_id:
+                logger.error("input_audio_buffer.committed without item_id")
+                self._fail_commit_waiter(
+                    RuntimeError("input_audio_buffer.committed without item_id")
+                )
+                return
+            if self._commit_waiter is None or self._commit_waiter[1].done():
+                # Ack for a commit that already failed (late) or that we never
+                # sent: it belongs to no turn. Never bind it; just remove it.
+                logger.warning(
+                    "input_audio_buffer.committed %s without a pending commit; deleting it",
+                    item_id,
+                )
+                await self._delete_item(item_id)
+                return
+            self._pending_item_signals[item_id] = set(_ITEM_DONE_SIGNALS)
+            self.committed_item_id = item_id
+            self._commit_waiter[1].set_result(item_id)
+        elif message_type == "error":
+            err = data.get("error") or {}
+            if self._commit_waiter is not None and err.get("event_id") == self._commit_waiter[0]:
+                self._fail_commit_waiter(RuntimeError(
+                    f"OpenAI rejected input_audio_buffer.commit "
+                    f"(type={err.get('type', 'unknown')} code={err.get('code', 'unknown')})"
+                ))
+        elif message_type == "response.done":
+            metadata = (data.get("response") or {}).get("metadata") or {}
+            await self._mark_item_signal(metadata.get(TURN_ITEM_METADATA_KEY), "response")
+        elif message_type in (
+            "conversation.item.input_audio_transcription.completed",
+            "conversation.item.input_audio_transcription.failed",
+        ):
+            await self._mark_item_signal(data.get("item_id"), "transcript")
+
+    async def _mark_item_signal(self, item_id: Optional[str], signal: str):
+        signals = self._pending_item_signals.get(item_id)
+        if signals is None:
+            return
+        signals.discard(signal)
+        if not signals:
+            del self._pending_item_signals[item_id]
+            await self._delete_item(item_id)
+
+    async def _delete_item(self, item_id: str):
+        """Best-effort removal of a finished turn item from the conversation.
+
+        Bounds session size/cost only; correctness never depends on it.
+        """
+        event_id = self._next_event_id("delete")
+        self._delete_event_ids[event_id] = item_id
+        try:
+            await self.ws.send(json.dumps({
+                "type": "conversation.item.delete",
+                "item_id": item_id,
+                "event_id": event_id,
+            }))
+        except websockets.exceptions.ConnectionClosed as e:
+            # Session is gone; its conversation goes with it.
+            self._delete_event_ids.pop(event_id, None)
+            logger.warning("Could not delete conversation item %s: %s", item_id, e)
     
     async def default_handler(self, data: dict):
         """Override default handler for OpenAI-specific logging"""
@@ -330,12 +483,60 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
                 logger.error("WebSocket is not open. Cannot send audio. (suppressing repeats for 5s)")
                 self._last_send_error_log = now
     
-    async def commit_audio(self):
-        """Commit the audio buffer and notify OpenAI"""
+    async def commit_audio(self) -> str:
+        """Commit the audio buffer and return the committed user item id.
+
+        Waits for input_audio_buffer.committed so start_response() can reference
+        exactly this item. Raises if the provider rejects the commit or never
+        acknowledges it; the turn then has no item to transcribe.
+
+        Invariant: at most one commit is in flight per client, and a commit
+        starts only after the previous turn ended (callers serialize turns:
+        micwave SessionPool lock, desktop single stop flow). The committed ack
+        is matched to the in-flight commit by arrival alone, and the stale-item
+        sweep below assumes earlier turns are over.
+
+        Any failure here (timeout, rejection, malformed ack, disconnect,
+        cancellation) leaves an unmatched commit behind whose ack may still
+        arrive, so the client then refuses all further commits with
+        TurnIsolationBrokenError; callers must close it and build a new one.
+        """
         self._require_ws_open()
-        commit_message = json.dumps({"type": "input_audio_buffer.commit"})
-        await self.ws.send(commit_message)
-        logger.info("Sent input_audio_buffer.commit message to OpenAI")
+        if self._turn_isolation_broken:
+            raise TurnIsolationBrokenError(
+                "an earlier commit failed on this session; recreate the client"
+            )
+        if self._commit_waiter is not None:
+            raise RuntimeError("commit_audio() called while another commit is in flight")
+        self._turn_item_id = None
+        self.committed_item_id = None
+        event_id = self._next_event_id("commit")
+        future = asyncio.get_running_loop().create_future()
+        self._commit_waiter = (event_id, future)
+        try:
+            await self.ws.send(json.dumps({
+                "type": "input_audio_buffer.commit",
+                "event_id": event_id,
+            }))
+            logger.info("Sent input_audio_buffer.commit message to OpenAI")
+            try:
+                item_id = await asyncio.wait_for(future, timeout=COMMIT_ACK_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                raise CommitNotAcknowledgedError(
+                    f"input_audio_buffer.committed not received within {COMMIT_ACK_TIMEOUT_SEC:.0f}s"
+                ) from None
+        except BaseException:
+            self._turn_isolation_broken = True
+            raise
+        finally:
+            self._commit_waiter = None
+        # Items of earlier turns that never got both completion signals
+        # (timeouts, errors) are removed now; their turns are over.
+        for stale_item_id in [i for i in self._pending_item_signals if i != item_id]:
+            del self._pending_item_signals[stale_item_id]
+            await self._delete_item(stale_item_id)
+        self._turn_item_id = item_id
+        return item_id
     
     async def clear_audio_buffer(self):
         """Clear the audio buffer"""
@@ -347,10 +548,22 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             logger.error("WebSocket is not open. Cannot clear audio buffer.")
     
     async def start_response(self, instructions: str):
-        """Start a new response with given instructions"""
+        """Start the response for the item committed by commit_audio().
+
+        The response is out-of-band (conversation "none") and its input is only
+        this turn's audio item, so earlier turns left in a reused session can
+        never reach the model (task 1082).
+        """
         self._require_ws_open()
+        item_id = self._turn_item_id
+        if item_id is None:
+            raise RuntimeError("start_response() requires a successful commit_audio() for this turn")
+        self._turn_item_id = None
         response_config = {
             "output_modalities": ["text"],
+            "conversation": "none",
+            "input": [{"type": "item_reference", "id": item_id}],
+            "metadata": {TURN_ITEM_METADATA_KEY: item_id},
         }
         if self.include_instructions_each_response and instructions:
             response_config["instructions"] = instructions
@@ -365,7 +578,7 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
             "response": response_config
         }))
         logger.info(
-            "Started response (text-only)"
+            f"Started out-of-band response for {item_id} (text-only)"
             + (
                 " (with per-response instructions)"
                 if self.include_instructions_each_response

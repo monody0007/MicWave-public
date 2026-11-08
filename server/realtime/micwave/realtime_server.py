@@ -1823,23 +1823,20 @@ class TurnSession:
                 # (can be overridden via env flag on client side).
                 await self._client.start_response(get_optimize_prompt())
                 logger.info("Response started successfully")
-            except ConnectionError as e:
+            except Exception as e:
+                # Finalize exactly once (it is idempotent: a provider error frame
+                # may already have finalized this turn and sent status:idle).
+                # Both reasons are non-successful, so finalize closes the
+                # provider client and the next turn builds a fresh session; a
+                # failed commit leaves the old one unusable (task 1082).
+                reason = (
+                    "provider_unavailable" if isinstance(e, ConnectionError) else "commit_failed"
+                )
                 logger.error(
-                    f"Provider unavailable while committing/starting response on stop: {str(e)}",
+                    f"Error committing/starting response on stop ({reason}): {str(e)}",
                     exc_info=True,
                 )
-                await self._finalize_turn("provider_unavailable")
-                return
-            except Exception as e:
-                logger.error(f"Error committing/starting response on stop: {str(e)}", exc_info=True)
-                # If we fail to kick off a response, surface that we're no longer recording
-                status_payload = {
-                    "type": "status",
-                    "status": "idle"
-                }
-                if self._active_turn_id is not None:
-                    status_payload["turn_id"] = self._active_turn_id
-                await self._websocket.send_text(json.dumps(status_payload, ensure_ascii=False))
+                await self._finalize_turn(reason)
                 return
             if done_event is None:
                 logger.error("Turn has no completion Event, forcing finalization")

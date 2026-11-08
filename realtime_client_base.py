@@ -70,8 +70,12 @@ class RealtimeClientBase(ABC):
         pass
     
     @abstractmethod
-    async def commit_audio(self):
-        """Commit the audio buffer."""
+    async def commit_audio(self) -> str:
+        """Commit the audio buffer and return the committed item id.
+
+        The next response must be built from this item alone, never from the
+        session's accumulated conversation (task 1082).
+        """
         pass
     
     @abstractmethod
