@@ -16,3 +16,4 @@ python-dotenv
 pyaudio
 pynput
 rumps  # macOS menubar app
+av>=19.0.1

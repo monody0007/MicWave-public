@@ -12,8 +12,9 @@ correctness fixes (H1/H2/H3):
   * single barrier (H2)  — every exit path (completed/failed/timeout/commit
                           error) sends idle once; provider text after finalize is
                           dropped (no idle→text, no idle→text→idle)
-  * finalize reconciliation — partial/completed are compared after trimming and
-                          the longer nonblank view wins (ties retain partial)
+  * finalize reconciliation — nonblank completed text owns the item; blank
+                          completed falls back to partial, equivalent whitespace
+                          retains the streamed view
   * S1 invariant         — any replacement lands strictly before a single idle
   * 60-min rebuild        — the session rotates once past the max-age guard
 
@@ -29,13 +30,10 @@ import time
 import pytest
 from starlette.websockets import WebSocketState
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-from whisper_backend.config import WHISPER_TRANSCRIBE_MODEL
-from whisper_backend import realtime_server as realtime_server_module
-from whisper_backend.realtime_server import (
+from micwave_core.config import WHISPER_TRANSCRIBE_MODEL
+from micwave_core import whisper_server as realtime_server_module
+from micwave_core.whisper_server import (
     TranscriptionTurnSession,
     TranscriptionTurnSessionConfig,
     TransportState,
@@ -396,8 +394,8 @@ async def test_completed_matches_streamed_flushes_without_replacement():
 async def test_semantic_policy_is_final_only_and_replaces_before_idle(caplog):
     session = make_session()
     bind_confirmed(session, "item_1")
-    provider_raw = "这里有四个字母，缩写是 SOT，Google Cloud Code 和功利主义"
-    normalized = "这里有4个字母，缩写是 SSOT，Google Cloud Code 和功利主义"
+    provider_raw = "这里有四个字母，缩写是 SOT，Google Cloud Code 和第一性原理"
+    normalized = "这里有4个字母，缩写是 SSOT，Google Cloud Code 和第一性原理"
 
     with caplog.at_level(logging.INFO):
         await session._on_transcription_delta(
@@ -481,8 +479,8 @@ async def test_completed_longer_than_stream_replaces_wholesale():
 
 
 @pytest.mark.asyncio
-async def test_completed_shorter_than_stream_keeps_longer_partial():
-    """Grapeot defense: a shorter completed cannot truncate the longer partial."""
+async def test_completed_shorter_than_stream_replaces_provisional_partial():
+    """Completed is the item's final even when a correction reduces length."""
     session = make_session()
     bind_confirmed(session, "item_1")
     long_partial = "这是一段很长的流式转写文本内容一直在增长而且相当冗长啰嗦重复"
@@ -494,8 +492,8 @@ async def test_completed_shorter_than_stream_keeps_longer_partial():
     await drain_finalize(session)
 
     replacements = [p for p in _texts(session) if p.get("isNewResponse") is True]
-    assert replacements == []
-    assert session._emitted_text == long_partial
+    assert [p["content"] for p in replacements] == [short_final]
+    assert session._emitted_text == short_final
     _assert_s1(session)
 
 
@@ -1128,7 +1126,7 @@ async def test_negprobe_late_delta_after_timeout_idle():
 
 @pytest.mark.asyncio
 async def test_negprobe_shorter_completed_authority():
-    """Replay: streamed long, completed short → longer partial prevents truncation."""
+    """Replay: streamed long, completed short resolves to the confirmed final."""
     session = make_session()
     bind_confirmed(session, "item_1")
     await session._on_transcription_delta(
@@ -1139,7 +1137,7 @@ async def test_negprobe_shorter_completed_authority():
     assert len(completed) < len(actual_before)
     await session._on_transcription_completed({"item_id": "item_1", "transcript": completed})
     await drain_finalize(session)
-    assert session._emitted_text == actual_before
+    assert session._emitted_text == completed
     _assert_s1(session)
 
 
@@ -3342,14 +3340,315 @@ async def test_full_rollover_tail_backpressure_timeout_uses_failure_barrier():
 @pytest.mark.parametrize(
     "completed, partial, expected",
     [
-        ("short", "a materially longer streamed partial", "a materially longer streamed partial"),
+        ("short", "a materially longer streamed partial", "short"),
         ("a materially longer completed result", "short", "a materially longer completed result"),
         ("  same  ", "same", "same"),
         ("", "partial", "partial"),
         ("completed", "", "completed"),
     ],
 )
-def test_w10_finalize_transcript_resolver_prefers_longer_nonblank_text(
+def test_finalize_transcript_resolver_prefers_nonblank_completed_text(
     completed, partial, expected
 ):
     assert TranscriptionTurnSession._select_completed_authority(completed, partial) == expected
+
+
+@pytest.mark.asyncio
+async def test_duplicate_delta_event_is_idempotent_but_spoken_repetition_is_kept():
+    session = make_session()
+    bind_confirmed(session, "repeat-item")
+    phrase = "Please check this sentence. "
+    first = {"event_id": "event-1", "item_id": "repeat-item", "delta": phrase}
+    await session._on_transcription_delta(first)
+    await session._on_transcription_delta(dict(first))
+    await session._on_transcription_delta(
+        {"event_id": "event-2", "item_id": "repeat-item", "delta": phrase}
+    )
+
+    assert session._provider_epoch_text == phrase * 2
+    assert [p["content"] for p in _texts(session)] == [phrase, phrase]
+    await session._on_transcription_completed(
+        {"item_id": "repeat-item", "transcript": phrase * 2}
+    )
+    await drain_finalize(session)
+    assert session._emitted_text == phrase * 2
+    assert len(_idles(session)) == 1
+    _assert_s1(session)
+
+
+@pytest.mark.asyncio
+async def test_completed_correction_replaces_repeated_partial_and_keeps_unique_tail():
+    session = make_session()
+    bind_confirmed(session, "corrected-item")
+    prefix = "The first point is ready. "
+    phrase = "The repeated provisional paragraph is still being revised. "
+    final = prefix + phrase + "The final point is a unique closing sentence."
+    await session._on_transcription_delta(
+        {"item_id": "corrected-item", "delta": prefix + phrase * 31}
+    )
+    await session._on_transcription_completed(
+        {"item_id": "corrected-item", "transcript": final}
+    )
+    await drain_finalize(session)
+
+    assert session._provider_completed_text == final
+    assert session._emitted_text == final
+    replacements = [p for p in _texts(session) if p.get("isNewResponse")]
+    assert replacements == [
+        {"type": "text", "content": final, "isNewResponse": True, "turn_id": 900}
+    ]
+    assert len(_idles(session)) == 1
+    _assert_s1(session)
+
+
+@pytest.mark.asyncio
+async def test_completed_transcript_retains_legitimate_repeated_paragraphs():
+    session = make_session()
+    bind_confirmed(session, "spoken-repeat-item")
+    final = "Repeat this full sentence for emphasis. " * 3 + "A unique ending."
+    await session._on_transcription_completed(
+        {"item_id": "spoken-repeat-item", "transcript": final}
+    )
+    await drain_finalize(session)
+
+    assert session._emitted_text == final
+    assert len(_idles(session)) == 1
+    _assert_s1(session)
+
+
+@pytest.mark.asyncio
+async def test_completed_item_rejects_delta_queued_before_finalize_task_runs():
+    session = make_session()
+    bind_confirmed(session, "sealed-item")
+    final = "This is the complete result."
+    await session._on_transcription_delta({"item_id": "sealed-item", "delta": final})
+    await session._on_transcription_completed(
+        {"item_id": "sealed-item", "transcript": final}
+    )
+    await session._on_transcription_delta(
+        {"item_id": "sealed-item", "delta": " A stale repeated addition."}
+    )
+    await drain_finalize(session)
+
+    assert session._provider_epoch_text == final
+    assert session._emitted_text == final
+    assert [p["content"] for p in _texts(session)] == [final]
+    _assert_s1(session)
+
+
+@pytest.mark.asyncio
+async def test_missing_event_ids_preserve_each_new_delta_without_content_dedup():
+    session = make_session()
+    phrase = "Repeat this phrase. "
+    for _ in range(3):
+        await session._on_transcription_delta({"item_id": "no-event-id", "delta": phrase})
+    assert session._provider_epoch_text == phrase * 3
+    assert [p["content"] for p in _texts(session)] == [phrase] * 3
+
+
+@pytest.mark.asyncio
+async def test_delta_event_identity_is_scoped_to_provider_epoch():
+    session = make_session()
+    await session._on_transcription_delta(
+        {"item_id": "old-item", "event_id": "reused-event", "delta": "Old partial. "}
+    )
+    async with session._transport_lock:
+        session._begin_provider_epoch_locked()
+    await session._on_transcription_delta(
+        {"item_id": "new-item", "event_id": "reused-event", "delta": "New final. "}
+    )
+    assert session._provider_epoch_text == "New final. "
+    bind_confirmed(session, "new-item")
+    await session._on_transcription_completed({"item_id": "new-item", "transcript": "New final. "})
+    await drain_finalize(session)
+    assert session._emitted_text == "New final. "
+
+
+@pytest.mark.parametrize("second_is_loop", [False, True, "blank-with-loop-partial"])
+@pytest.mark.asyncio
+async def test_pathological_completed_replays_audio_once_and_rejects_stale_callbacks(
+    second_is_loop,
+):
+    session = make_session()
+    original = FakeClient()
+    replacement = FakeClient()
+    session._client = original
+    session._provider_generation = 60
+    session._register_client_handlers(original)
+    frames = [_distinct_frame(seed) for seed in range(151, 156)]
+    for frame in frames:
+        await session._handle_audio_bytes(frame)
+    unit = "".join(f"{index:03d} " for index in range(45))
+    loop = "Unique preface. " + unit * 31 + "Unique ending."
+    clean = "A complete recovered transcript with a unique ending."
+    commits = []
+
+    async def first_commit():
+        commits.append("first")
+        await original.handlers["input_audio_buffer.committed"]({"item_id": "rejected-item"})
+        await original.handlers["conversation.item.input_audio_transcription.delta"](
+            {"item_id": "rejected-item", "event_id": "first-delta", "delta": loop}
+        )
+        await original.handlers["conversation.item.input_audio_transcription.completed"](
+            {"item_id": "rejected-item", "transcript": loop}
+        )
+        assert session._result_retry_pending is True
+        await original.handlers["conversation.item.input_audio_transcription.delta"](
+            {"delta": "A stale missing-item delta."}
+        )
+        await original.handlers["conversation.item.input_audio_transcription.completed"](
+            {"item_id": "rejected-item", "transcript": "A stale terminal."}
+        )
+        await original.handlers["conversation.item.input_audio_transcription.failed"](
+            {"item_id": "rejected-item", "error": {"code": "stale_failure"}}
+        )
+        await original.handlers["error"]({"error": {"message": "stale error"}})
+        assert session._transcript_completed is False
+        assert session._provider_epoch_text == ""
+
+    async def second_commit():
+        commits.append("second")
+
+        async def finish():
+            await replacement.handlers["input_audio_buffer.committed"]({"item_id": "retried-item"})
+            if second_is_loop == "blank-with-loop-partial":
+                await replacement.handlers["conversation.item.input_audio_transcription.delta"](
+                    {"item_id": "retried-item", "delta": loop}
+                )
+            await replacement.handlers["conversation.item.input_audio_transcription.completed"](
+                {
+                    "item_id": "retried-item",
+                    "transcript": "   " if second_is_loop == "blank-with-loop-partial" else loop if second_is_loop else clean,
+                }
+            )
+
+        asyncio.create_task(finish())
+
+    original.commit_audio = first_commit
+    replacement.commit_audio = second_commit
+    _stub_reconnect_to(session, replacement)
+    await asyncio.wait_for(session._handle_stop_recording({"turn_id": 900}), 1)
+
+    assert commits == ["first", "second"]
+    assert original.sent_audio == replacement.sent_audio == frames
+    assert session._finalize_commit_attempts == 2
+    assert len(_idles(session)) == 1
+    errors = [p for p in session._websocket.sent if p.get("type") == "error"]
+    if second_is_loop:
+        assert len(errors) == 1
+        assert errors[0]["terminal"] is True
+        assert errors[0]["reason"] == "repeated_transcript"
+        assert session._emitted_text == ""
+        error_index = session._websocket.sent.index(errors[0])
+        idle_index = session._websocket.sent.index(_idles(session)[0])
+        assert error_index < idle_index
+    else:
+        assert errors == []
+        assert session._emitted_text == clean
+        assert session._normalized_final_text == clean
+    _assert_s1(session)
+
+
+@pytest.mark.asyncio
+async def test_completed_metrics_distinguish_raw_final_from_longer_partial(caplog):
+    session = make_session()
+    bind_confirmed(session, "metric-item")
+    await session._on_transcription_delta({"item_id": "metric-item", "delta": "A much longer partial"})
+    with caplog.at_level(logging.INFO, logger=realtime_server_module.__name__):
+        await session._on_transcription_completed({"item_id": "metric-item", "transcript": "Final"})
+        await drain_finalize(session)
+    assert "raw_len=5 completed_len=5 partial_len=21 source=completed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_suspect_retry_timeout_cannot_expose_known_bad_partial_as_success():
+    session = make_session(transcription_finalize_timeout_sec=0.01)
+    original, replacement = FakeClient(), FakeClient()
+    session._client = original
+    session._provider_generation = 80
+    session._register_client_handlers(original)
+    frames = [_distinct_frame(seed) for seed in range(171, 176)]
+    for frame in frames:
+        await session._handle_audio_bytes(frame)
+    unit = "".join(f"{index:03d} " for index in range(45))
+    loop = unit * 31
+
+    async def first_commit():
+        await original.handlers["input_audio_buffer.committed"]({"item_id": "timeout-first"})
+        await original.handlers["conversation.item.input_audio_transcription.completed"](
+            {"item_id": "timeout-first", "transcript": loop}
+        )
+
+    async def second_commit():
+        async def partial_without_completed():
+            await replacement.handlers["input_audio_buffer.committed"]({"item_id": "timeout-second"})
+            await replacement.handlers["conversation.item.input_audio_transcription.delta"](
+                {"item_id": "timeout-second", "delta": loop}
+            )
+
+        asyncio.create_task(partial_without_completed())
+
+    original.commit_audio = first_commit
+    replacement.commit_audio = second_commit
+    _stub_reconnect_to(session, replacement)
+    await asyncio.wait_for(session._handle_stop_recording({"turn_id": 900}), 1)
+    errors = [p for p in session._websocket.sent if p.get("type") == "error"]
+    assert len(errors) == 1 and errors[0]["terminal"] is True
+    assert errors[0]["reason"] == "repeated_transcript"
+    assert session._finalize_commit_attempts == 2
+    assert len(_idles(session)) == 1
+    assert session._websocket.sent.index(errors[0]) < session._websocket.sent.index(_idles(session)[0])
+
+
+@pytest.mark.asyncio
+async def test_suspect_retry_transport_exhaustion_has_explicit_terminal_error():
+    session = make_session()
+    original = FakeClient()
+    session._client = original
+    session._provider_generation = 81
+    session._register_client_handlers(original)
+    frames = [_distinct_frame(seed) for seed in range(181, 186)]
+    for frame in frames:
+        await session._handle_audio_bytes(frame)
+    loop = "".join(f"{index:03d} " for index in range(45)) * 31
+
+    async def commit():
+        await original.handlers["input_audio_buffer.committed"]({"item_id": "unrecoverable"})
+        await original.handlers["conversation.item.input_audio_transcription.completed"](
+            {"item_id": "unrecoverable", "transcript": loop}
+        )
+
+    attempts = []
+
+    async def failed_reconnect(**kwargs):
+        attempts.append(True)
+        return False
+
+    original.commit_audio = commit
+    session._init_or_reuse_client = failed_reconnect
+    session._RECONNECT_BACKOFF_BASE_SEC = 0
+    await asyncio.wait_for(session._handle_stop_recording({"turn_id": 900}), 1)
+    errors = [p for p in session._websocket.sent if p.get("type") == "error"]
+    assert len(attempts) == 5
+    assert len(errors) == 1 and errors[0]["terminal"] is True
+    assert session._emitted_text == ""
+    assert len(_idles(session)) == 1
+
+
+@pytest.mark.parametrize(
+    "reason", ["timeout", "reconnect_exhausted", "provider_disconnect_after_finalize_retry", "transcription.failed"]
+)
+@pytest.mark.asyncio
+async def test_failure_barrier_rejects_looping_partial_without_any_completed(reason):
+    session = make_session()
+    unit = "".join(f"{index:03d} " for index in range(45))
+    await session._on_transcription_delta({"item_id": "partial-loop", "delta": unit * 31})
+    assert session._repetition_retry_started is False
+    await session._finalize_turn(reason)
+    errors = [p for p in session._websocket.sent if p.get("type") == "error"]
+    assert len(errors) == 1 and errors[0]["terminal"] is True
+    assert errors[0]["reason"] == "repeated_transcript"
+    assert session._emitted_text == ""
+    assert session._transcript_text == ""
+    assert len(_idles(session)) == 1
+    assert session._websocket.sent.index(errors[0]) < session._websocket.sent.index(_idles(session)[0])

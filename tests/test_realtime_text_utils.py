@@ -3,11 +3,8 @@ import sys
 
 import pytest
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-from realtime_text_utils import (
+from micwave_core.realtime_text_utils import (
     NO_SPEECH_PLACEHOLDER,
     StreamingNoSpeechPrefixGuard,
     StreamingHomonymCorrector,

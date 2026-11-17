@@ -1,13 +1,53 @@
+"""Configuration defaults and safe environment parsers for micwave-core.
+
+Contains zero hardcoded secrets and performs no implicit ``.env`` file reads at
+import time; callers inject credentials via environment variables or Secret
+Manager loaders.
+"""
+
+from __future__ import annotations
+
 import logging
 import os
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── WhisperWave: pure Realtime transcription session (task 0436 Phase 2) ──
-# The whole point of this prototype: a `type:"transcription"` Realtime session
-# backed by a transcription-only model. `gpt-4o-transcribe` accepts a vocabulary
-# bias prompt inside its transcription config, while the session still has no
-# assistant answer surface, response marker, or answer guard.
+DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime-2.1-mini"
+OPENAI_REALTIME_MODEL = (
+    os.getenv("OPENAI_REALTIME_MODEL") or ""
+).strip() or DEFAULT_OPENAI_REALTIME_MODEL
+
+OPENAI_REALTIME_MODALITIES = os.getenv("OPENAI_REALTIME_MODALITIES", "text").split(",")
+
+
+def _optional_int_in_range(name: str, low: int, high: int) -> Optional[int]:
+    """Return int(env[name]) if set, parseable and within [low, high], else None."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r (not an integer); ignoring", name, raw)
+        return None
+    if not (low <= value <= high):
+        logger.warning(
+            "Invalid %s=%r (must be an integer in [%d, %d]); ignoring",
+            name,
+            raw,
+            low,
+            high,
+        )
+        return None
+    return value
+
+
+BRAINWAVE_MAX_OUTPUT_TOKENS = _optional_int_in_range(
+    "BRAINWAVE_MAX_OUTPUT_TOKENS", 1, 4096
+)
+
+# ── WhisperWave transcription-session configuration ──
 DEFAULT_WHISPER_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 
 
@@ -19,13 +59,8 @@ WHISPER_TRANSCRIBE_MODEL = _model_env(
     "WHISPERWAVE_MODEL", DEFAULT_WHISPER_TRANSCRIBE_MODEL
 )
 
-# Kept for menubar↔server protocol compatibility; unused by a transcription
-# session (which has no output_modalities face).
-OPENAI_REALTIME_MODALITIES = os.getenv("WHISPERWAVE_MODALITIES", "text").split(",")
+WHISPERWAVE_MODALITIES = os.getenv("WHISPERWAVE_MODALITIES", "text").split(",")
 
-# Streaming transcription delay tier for gpt-realtime-whisper. The live API
-# rejects this field for gpt-4o-transcribe, so the client applies it only to a
-# compatible model. Invalid configured values still fall back to "low".
 _VALID_DELAYS = ("minimal", "low", "medium", "high", "xhigh")
 _DELAY_CAPABLE_MODELS = frozenset({"gpt-realtime-whisper"})
 
@@ -37,7 +72,10 @@ def _delay_env(name: str, default: str = "low") -> str:
     if raw not in _VALID_DELAYS:
         logger.warning(
             "Invalid %s=%r (must be one of %s); using %s",
-            name, raw, list(_VALID_DELAYS), default,
+            name,
+            raw,
+            list(_VALID_DELAYS),
+            default,
         )
         return default
     return raw
@@ -48,16 +86,13 @@ WHISPERWAVE_DELAY = _delay_env("WHISPERWAVE_DELAY", "low")
 
 def transcription_delay_for_model(model: str, delay: str) -> str:
     """Return a delay only when the selected model supports the field."""
-
     if model not in _DELAY_CAPABLE_MODELS or not isinstance(delay, str):
         return ""
     return delay.strip()
 
-# Optional language hint (e.g. "en", "zh"). Empty by default so CN/EN
-# code-switching is not forced to a single language.
+
 WHISPERWAVE_LANGUAGE = (os.getenv("WHISPERWAVE_LANGUAGE") or "").strip()
 
-# Optional input noise reduction: near_field / far_field. Empty = off (null).
 _VALID_NOISE = ("near_field", "far_field")
 
 
@@ -74,6 +109,4 @@ def _noise_env(name: str) -> str:
 
 
 WHISPERWAVE_NOISE_REDUCTION = _noise_env("WHISPERWAVE_NOISE_REDUCTION")
-
-# Realtime session sample rate for input audio (Hz).
 WHISPERWAVE_INPUT_SAMPLE_RATE = 24000

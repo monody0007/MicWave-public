@@ -20,6 +20,7 @@ from backend_runtime import (
     BackendSupervisor,
     build_default_descriptors,
 )
+from micwave_core.whisper_adapter import DOTENV_ALLOWED_KEYS as _WHISPER_DOTENV_ALLOWED_KEYS
 
 
 PROJECT_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -88,33 +89,6 @@ _ECHO_DOTENV_ALLOWED_KEYS = frozenset(
         "BRAINWAVE_VERBOSE_SERVER_LOG",
         "OPENAI_REALTIME_MODALITIES",
         "OPENAI_REALTIME_MODEL",
-    }
-)
-_WHISPER_DOTENV_ALLOWED_KEYS = frozenset(
-    {
-        "WHISPERWAVE_DEBUG_LOG",
-        "WHISPERWAVE_DELAY",
-        "WHISPERWAVE_FORCE_RECONNECT_AFTER_MS",
-        "WHISPERWAVE_KEEP_PROVIDER_SESSION",
-        "WHISPERWAVE_LANGUAGE",
-        "WHISPERWAVE_MAX_TURN_AUDIO_BYTES",
-        "WHISPERWAVE_MODALITIES",
-        "WHISPERWAVE_MODEL",
-        "WHISPERWAVE_NOISE_REDUCTION",
-        "WHISPERWAVE_PORT",
-        "WHISPERWAVE_PROVIDER_EVENT_METRICS",
-        "WHISPERWAVE_PROVIDER_INIT_MAX_ATTEMPTS",
-        "WHISPERWAVE_PROVIDER_INIT_RETRY_DELAY_SEC",
-        "WHISPERWAVE_PROVIDER_SESSION_MAX_AGE_SEC",
-        "WHISPERWAVE_PROVIDER_SESSION_MAX_TURNS",
-        "WHISPERWAVE_SERVER_AUDIO_CACHE_DIR",
-        "WHISPERWAVE_SERVER_AUDIO_CACHE_ENABLED",
-        "WHISPERWAVE_SERVER_AUDIO_CACHE_LIMIT",
-        "WHISPERWAVE_SERVER_AUDIO_FILENAME_PREFIX",
-        "WHISPERWAVE_TRANSCRIPTION_ACK_GRACE_SEC",
-        "WHISPERWAVE_TRANSCRIPTION_FAILURE_ROTATE_THRESHOLD",
-        "WHISPERWAVE_TRANSCRIPTION_FINALIZE_TIMEOUT_SEC",
-        "WHISPERWAVE_VERBOSE_SERVER_LOG",
     }
 )
 _DOTENV_ALLOWED_KEYS = _ECHO_DOTENV_ALLOWED_KEYS | _WHISPER_DOTENV_ALLOWED_KEYS
@@ -329,15 +303,13 @@ def preflight_check() -> bool:
 def run_server_foreground():
     """Compatibility entry point for the stable Echo backend only."""
     os.chdir(RESOURCE_DIR)
-    from realtime_server import app
+    from micwave_core.realtime_server import app
     import uvicorn
 
     uvicorn.run(app, host="127.0.0.1", port=23456)
 
 
 def run_menubar_directly(supervisor, selection_store, startup_decision):
-    if RESOURCE_DIR not in sys.path:
-        sys.path.insert(0, RESOURCE_DIR)
     os.chdir(RESOURCE_DIR)
     print(
         "[Launcher] Starting one menubar/hotkey owner with "

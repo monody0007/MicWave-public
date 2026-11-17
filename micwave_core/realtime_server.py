@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import functools
 import json
 import logging
 import math
@@ -14,15 +15,17 @@ import uvicorn
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
-from config import (
+from .config import (
     OPENAI_REALTIME_MODEL,
     OPENAI_REALTIME_MODALITIES,
 )
-from audio_persistence import TurnAudioCache
-from openai_realtime_client import OpenAIRealtimeAudioTextClient
-from prompts import get_optimize_prompt
-from realtime_client_base import RealtimeClientBase
-from realtime_text_utils import (
+from .audio_gain import StreamingSpeechAGC, speech_activity_secs
+from .audio_persistence import TurnAudioCache
+from .openai_realtime_client import OpenAIRealtimeAudioTextClient
+from .prompts import get_optimize_prompt
+from .realtime_client_base import RealtimeClientBase
+from .realtime_text_utils import (
+    INCOMPLETE_TURN_MARKER,
     NO_SPEECH_PLACEHOLDER,
     SIMILARITY_HARD_CAP_CHARS,
     StreamingHomonymCorrector,
@@ -30,11 +33,14 @@ from realtime_text_utils import (
     answer_guard_fingerprint,
     emitted_novel_material_ratio,
     extract_text_after_marker,
+    is_likely_truncated_input_transcript,
     is_no_speech_placeholder_only,
+    is_runaway_repetition_transcript,
     parse_ratio_env,
+    scaled_suspicious_output_chars,
     transcription_similarity_ratio,
 )
-from transcript_merge import merge_incremental_text
+from .transcript_merge import merge_incremental_text
 
 # Configure logging
 logging.basicConfig(
@@ -44,11 +50,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 VERBOSE_SERVER_LOG = os.getenv("BRAINWAVE_VERBOSE_SERVER_LOG", "0") == "1"
 
-app = FastAPI()
 
-@app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -118,6 +123,11 @@ class TurnSessionConfig:
     # effective grace = min(max(cap, base), base + per_audio * audio_sec).
     input_transcript_grace_per_audio_sec: float = 0.03
     input_transcript_grace_max_sec: float = 30.0
+    # High-pass + gated dynamic AGC on the PCM sent to the provider (task 1193).
+    # Off by default so directly constructed configs forward raw bytes;
+    # from_env() turns it on for production. Turn metrics, the silence gates
+    # and the cached WAV always read the pre-AGC audio.
+    input_agc_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "TurnSessionConfig":
@@ -150,6 +160,7 @@ class TurnSessionConfig:
             suspicious_input_transcript_grace_sec=float_env("BRAINWAVE_SUSPICIOUS_INPUT_TRANSCRIPT_GRACE_SEC", 3.0, 0.0),
             input_transcript_grace_per_audio_sec=float_env("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_PER_AUDIO_SEC", 0.03, 0.0),
             input_transcript_grace_max_sec=float_env("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_MAX_SEC", 30.0, 0.0),
+            input_agc_enabled=os.getenv("BRAINWAVE_INPUT_AGC_ENABLED", "1") == "1",
             input_transcript_replacement_min_ratio=float_env("BRAINWAVE_INPUT_TRANSCRIPT_REPLACEMENT_MIN_RATIO", 1.75, 1.0),
             input_transcript_replacement_min_delta_chars=int_env("BRAINWAVE_INPUT_TRANSCRIPT_REPLACEMENT_MIN_DELTA_CHARS", 80, 0),
             default_source_sample_rate=AudioProcessor().source_sample_rate,
@@ -234,6 +245,7 @@ class TurnSession:
         self._consecutive_transcription_failures = 0
         self._openai_ready = asyncio.Event()
         self._audio_processor = AudioProcessor(source_sample_rate=config.default_source_sample_rate)
+        self._speech_agc = StreamingSpeechAGC(sample_rate=self._audio_processor.target_sample_rate)
         self._audio_cache = TurnAudioCache.from_env()
 
         self._reconnect_lock = asyncio.Lock()
@@ -376,6 +388,15 @@ class TurnSession:
         self._turn_peak_sample_abs = preserved_peak_sample_abs
         self._turn_frame_carry = preserved_frame_carry
         self._turn_signal_verdict = preserved_signal_verdict
+        if not preserve_pending_audio:
+            # Pending chunks kept for a same-turn retry were already gained;
+            # the AGC state belongs to them, so only a new turn resets it.
+            self._speech_agc.reset()
+        self._response_incomplete_status: Optional[str] = None
+        self._fallback_replaced = False
+        self._last_text_item_id: Optional[str] = None
+        self._new_item_prefix_buffer: Optional[str] = None
+        self._strip_new_item_newlines = False
 
     async def _send_text_payload(self, content: str, is_new_response: bool = False):
         if content and self._websocket.client_state == WebSocketState.CONNECTED:
@@ -615,6 +636,23 @@ class TurnSession:
             "no_speech_signal": no_speech_signal,
         }
 
+    def _turn_speech_activity_secs(self) -> Optional[tuple[float, float]]:
+        """``(active_speech_sec, tail_active_speech_sec)`` of this turn's audio,
+        or None when no frame was measured (W0322 R2 truncated-transcript
+        evidence). Uses the >= 300 Hz frame energy already computed for the
+        no-speech gate, so handling rumble (T80: 90 % of the energy under
+        80 Hz) is not counted as talking.
+        """
+        if not self._turn_frame_energy_hb300:
+            return None
+        window_mean_square = float(np.mean(self._NO_SPEECH_HANN_WINDOW ** 2))
+        band_rms = np.sqrt(
+            np.asarray(self._turn_frame_energy_hb300, dtype=np.float64)
+            / (self._NO_SPEECH_FRAME_SAMPLES * window_mean_square)
+        )
+        frame_sec = self._NO_SPEECH_FRAME_SAMPLES / float(self._audio_processor.target_sample_rate)
+        return speech_activity_secs(band_rms, frame_sec)
+
     def _log_turn_signal_metrics(
         self, signal_metrics: Optional[dict], verdict: str
     ):
@@ -662,7 +700,11 @@ class TurnSession:
             return False
         return (
             self._processed_audio_duration_sec() >= self._config.suspicious_marker_audio_sec
-            and len(current_text.strip()) <= self._config.suspicious_marker_emitted_chars
+            and len(current_text.strip())
+            <= scaled_suspicious_output_chars(
+                self._processed_audio_duration_sec(),
+                self._config.suspicious_marker_emitted_chars,
+            )
         )
 
     def _is_material_input_transcript_replacement(
@@ -703,6 +745,18 @@ class TurnSession:
         except Exception as e:
             logger.error(f"Error enqueueing audio cache on finalize ({reason}): {e}", exc_info=True)
         try:
+            if self._fallback_replaced:
+                self._new_item_prefix_buffer = None
+            else:
+                # Finalize without response.done (e.g. timeout): held body text
+                # of the last item is still owed to the user.
+                await self._flush_new_item_prefix_buffer()
+        except Exception as e:
+            logger.error(
+                f"Error flushing output-item prefix buffer on finalize ({reason}): {e}",
+                exc_info=True,
+            )
+        try:
             await self._flush_no_speech_prefix_guard()
         except Exception as e:
             logger.error(
@@ -713,6 +767,13 @@ class TurnSession:
             await self._flush_homonym_corrector()
         except Exception as e:
             logger.error(f"Error flushing homonym corrector on finalize ({reason}): {e}", exc_info=True)
+        try:
+            await self._replace_runaway_output_on_finalize(reason)
+        except Exception as e:
+            logger.error(
+                f"Error checking repeat-loop output on finalize ({reason}): {e}",
+                exc_info=True,
+            )
         forced_signal_replacement = False
         if (
             self._config.no_speech_guard_enabled
@@ -734,6 +795,12 @@ class TurnSession:
                 self._turn_signal_verdict,
                 self._processed_audio_duration_sec(),
             )
+        # The provider ended the response abnormally: whatever is shown must
+        # say so, and an empty result is an unfinished turn, never "no speech
+        # recognised" (task 1193 / W0322 R2).
+        abnormal_status = (
+            self._response_incomplete_status if reason == "response.done" else None
+        )
         emitted_is_placeholder_only = is_no_speech_placeholder_only(self._emitted_text)
         emitted_is_effectively_empty = (
             not self._emitted_text.strip() or emitted_is_placeholder_only
@@ -745,6 +812,7 @@ class TurnSession:
             and emitted_is_effectively_empty
             and not self._input_transcript_text.strip()
             and not forced_signal_replacement
+            and not abnormal_status
         ):
             if emitted_is_placeholder_only:
                 self._homonym_corrector.reset()
@@ -758,6 +826,24 @@ class TurnSession:
                 reason,
                 self._processed_audio_duration_sec(),
                 self._processed_audio_bytes,
+            )
+        if abnormal_status:
+            # A completed input transcript that replaced the output does not
+            # prove it covers the whole recording (T80: completed after two
+            # sentences), so a replaced output is marked too.
+            if not self._emitted_text.strip():
+                await self._send_text_payload(INCOMPLETE_TURN_MARKER, is_new_response=True)
+            elif (
+                not is_no_speech_placeholder_only(self._emitted_text)
+                and INCOMPLETE_TURN_MARKER not in self._emitted_text
+            ):
+                await self._send_text_payload("\n" + INCOMPLETE_TURN_MARKER)
+            logger.warning(
+                "Marked turn output incomplete (response status=%s, emitted_len=%d, "
+                "fallback_replaced=%s)",
+                abnormal_status,
+                len(self._emitted_text.strip()),
+                self._fallback_replaced,
             )
         emitted_len = len(self._emitted_text.strip()) if self._emitted_text else 0
         if (
@@ -837,7 +923,7 @@ class TurnSession:
         Returns:
             RealtimeClientBase instance
         """
-        api_key = OPENAI_API_KEY
+        api_key = OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY not set in environment variables")
         selected_model = model or OPENAI_REALTIME_MODEL
@@ -1142,6 +1228,17 @@ class TurnSession:
                 logger.warning("WebSocket not connected, ignoring text delta")
                 return
             delta = data.get("delta", "")
+            item_id = data.get("item_id")
+            if (
+                item_id
+                and self._new_item_prefix_buffer
+                and item_id != self._last_text_item_id
+            ):
+                # The previous item ended while its text still looked like a
+                # marker start (e.g. body text "下面是"): it is body text, so
+                # send it before the next item's buffer takes over (W0322 R2).
+                await self._flush_new_item_prefix_buffer()
+            delta = self._strip_repeated_marker_of_new_item(item_id, delta)
             logger.debug(
                 "Received text delta (delta_len=%d, marker_seen=%s, buffer_size=%d, delta_counter=%d)",
                 len(delta),
@@ -1212,6 +1309,55 @@ class TurnSession:
                 logger.debug(f"Handled response.text.delta (buffering), total buffer length: {len(joined)}")
         except Exception as e:
             logger.error(f"Error in handle_text_delta: {str(e)}", exc_info=True)
+
+    def _strip_repeated_marker_of_new_item(self, item_id, delta: str) -> str:
+        """Drop a marker prefix the model repeats at the start of a second
+        output item in the same response (task 1193), so it never reaches the
+        user. Deltas are held while they could still be the start of the
+        marker; the new item's text starts on a new line.
+        """
+        if item_id:
+            if (
+                self._marker_seen
+                and self._last_text_item_id is not None
+                and item_id != self._last_text_item_id
+            ):
+                self._new_item_prefix_buffer = ""
+            self._last_text_item_id = item_id
+        if not self._marker_seen:
+            return delta
+        if self._new_item_prefix_buffer is not None:
+            buffered = self._new_item_prefix_buffer + delta
+            head = buffered.lstrip()
+            marker_core = self._config.marker_prefix.rstrip("\n")
+            if head.startswith(marker_core):
+                logger.info("Stripped repeated marker prefix at start of output item")
+                self._new_item_prefix_buffer = None
+                self._strip_new_item_newlines = True
+                delta = head[len(marker_core):]
+            elif marker_core.startswith(head):
+                self._new_item_prefix_buffer = buffered
+                return ""
+            else:
+                self._new_item_prefix_buffer = None
+                return self._new_item_separator() + head
+        if self._strip_new_item_newlines:
+            body = delta.lstrip("\n")
+            if not body:
+                return ""
+            self._strip_new_item_newlines = False
+            return self._new_item_separator() + body
+        return delta
+
+    async def _flush_new_item_prefix_buffer(self) -> None:
+        held = self._new_item_prefix_buffer
+        self._new_item_prefix_buffer = None
+        if held and held.strip():
+            await self._emit_body_text_delta(self._new_item_separator() + held.lstrip())
+
+    def _new_item_separator(self) -> str:
+        view = self._current_emitted_view()
+        return "\n" if view and not view.endswith("\n") else ""
 
     async def _on_input_transcription_delta(self, data):
         try:
@@ -1289,6 +1435,11 @@ class TurnSession:
 
         current_text = current_text_for_fallback()
         suspicious_marker_output = self._is_suspicious_marker_output(current_text)
+        # A looping output can only be rescued by a completed transcript, so it
+        # waits for one like a suspicious marker output (task 1193 / W0322 R4).
+        output_loops_before_wait = bool(current_text) and is_runaway_repetition_transcript(
+            current_text, self._processed_audio_duration_sec()
+        )
         answer_guard_enabled = self._config.answer_guard_min_similarity > 0
         # Single bounded barrier before status:idle (task 0436 S1). Wait for the
         # faithful transcript only when it may be needed and has not arrived, so
@@ -1299,7 +1450,7 @@ class TurnSession:
             grace_sec = self._scaled_input_transcript_grace_sec(
                 self._config.input_transcript_grace_sec
             )
-        elif suspicious_marker_output:
+        elif suspicious_marker_output or output_loops_before_wait:
             grace_sec = self._scaled_input_transcript_grace_sec(
                 self._config.suspicious_input_transcript_grace_sec
             )
@@ -1351,9 +1502,77 @@ class TurnSession:
             return
 
         fallback_text = self._input_transcript_text.strip()
+        current_text = current_text_for_fallback()
+        audio_sec = self._processed_audio_duration_sec()
+        fallback_loops = bool(fallback_text) and is_runaway_repetition_transcript(
+            fallback_text, audio_sec
+        )
+        current_loops = bool(current_text) and is_runaway_repetition_transcript(
+            current_text, audio_sec
+        )
+        if current_loops:
+            # A looping output is never shown, with or without the marker and
+            # whatever state the input transcript is in (task 1193 / W0322 R4).
+            # Only a completed, non-empty, non-looping transcript can stand in;
+            # a failed, empty, partial or looping one marks the turn incomplete.
+            if self._input_transcript_completed and fallback_text and not fallback_loops:
+                logger.warning(
+                    "Model output looks like a repeat loop; replacing it with the "
+                    "completed input transcript (marker_seen=%s current_len=%d "
+                    "fallback_len=%d audio_sec=%.2f)",
+                    self._marker_seen,
+                    len(current_text),
+                    len(fallback_text),
+                    audio_sec,
+                )
+                await self._replace_emitted_text(fallback_text, turn_token)
+                return
+            logger.warning(
+                "Model output looks like a repeat loop and no completed transcript "
+                "can stand in (marker_seen=%s completed=%s fallback_len=%d "
+                "fallback_loops=%s current_len=%d audio_sec=%.2f); marking turn "
+                "incomplete",
+                self._marker_seen,
+                self._input_transcript_completed,
+                len(fallback_text),
+                fallback_loops,
+                len(current_text),
+                audio_sec,
+            )
+            await self._replace_emitted_text(INCOMPLETE_TURN_MARKER, turn_token)
+            return
         if not fallback_text:
             return
-        current_text = current_text_for_fallback()
+        if fallback_loops:
+            # A looping transcript is never shown (task 1193 / W0322 R2). Keep
+            # the (non-looping, checked above) model output only when it is
+            # evidence of its own: marker output, or no-marker output while the
+            # transcript is still incomplete (task 0809 keeps that). A
+            # no-marker answer over a completed loop, or nothing at all, is
+            # reported as an incomplete turn instead.
+            if current_text and (
+                self._marker_seen or not self._input_transcript_completed
+            ):
+                logger.warning(
+                    "Input transcript looks like a repeat loop; keeping model output "
+                    "(fallback_len=%d current_len=%d audio_sec=%.2f marker_seen=%s)",
+                    len(fallback_text),
+                    len(current_text),
+                    audio_sec,
+                    self._marker_seen,
+                )
+                return
+            logger.warning(
+                "Input transcript looks like a repeat loop and the model output "
+                "cannot stand in (marker_seen=%s current_len=%d "
+                "fallback_len=%d audio_sec=%.2f); marking turn incomplete",
+                self._marker_seen,
+                len(current_text),
+                len(fallback_text),
+                audio_sec,
+            )
+            await self._replace_emitted_text(INCOMPLETE_TURN_MARKER, turn_token)
+            return
 
         # When marker_seen is False the model did NOT follow the
         # transcription-only format (likely answered the user's speech
@@ -1422,6 +1641,30 @@ class TurnSession:
                     and self._config.answer_guard_novel_material_ratio > 0
                     and novel_ratio > self._config.answer_guard_novel_material_ratio
                 )
+                activity = self._turn_speech_activity_secs()
+                if (low_similarity or high_novelty) and await asyncio.to_thread(
+                    functools.partial(
+                        is_likely_truncated_input_transcript,
+                        current_text,
+                        fallback_text,
+                        self._processed_audio_duration_sec(),
+                        active_speech_sec=activity[0] if activity else None,
+                        tail_active_speech_sec=activity[1] if activity else None,
+                    )
+                ):
+                    logger.warning(
+                        "[answer-guard] keeping marker-following output because input "
+                        "transcript looks truncated (ratio=%s novel=%s emitted_len=%d "
+                        "input_len=%d audio_sec=%.2f active_sec=%s tail_active_sec=%s)",
+                        f"{ratio:.3f}" if ratio is not None else "n/a",
+                        f"{novel_ratio:.3f}" if novel_ratio is not None else "n/a",
+                        len(current_text),
+                        len(fallback_text),
+                        self._processed_audio_duration_sec(),
+                        f"{activity[0]:.1f}" if activity else "n/a",
+                        f"{activity[1]:.1f}" if activity else "n/a",
+                    )
+                    return
                 if low_similarity or high_novelty:
                     answer_guard_triggered = True
                     emitted_len, emitted_sha = answer_guard_fingerprint(current_text)
@@ -1477,34 +1720,94 @@ class TurnSession:
         ):
             return
 
+        if await self._replace_emitted_text(fallback_text, turn_token):
+            logger.info(
+                "Applied input transcription fallback before finalize "
+                "(fallback_len=%d current_len=%d marker_seen=%s)",
+                len(fallback_text),
+                len(current_text),
+                self._marker_seen,
+            )
+
+    async def _replace_runaway_output_on_finalize(self, reason: str) -> None:
+        """Last repeat-loop net inside the single finalize (task 1193 / W0322 R5).
+
+        timeout, provider error and disconnect finalize without the
+        response.done barrier, and may win a race against it; whichever path
+        finalizes first runs this exactly once, before status:idle. A looping
+        output is replaced by a completed, non-empty, non-looping input
+        transcript, otherwise by the incomplete-turn marker alone.
+        """
+        emitted = self._emitted_text or ""
+        stripped = (
+            emitted.replace(INCOMPLETE_TURN_MARKER, "")
+            .replace(NO_SPEECH_PLACEHOLDER, "")
+            .strip()
+        )
+        if not stripped:
+            return
+        audio_sec = self._processed_audio_duration_sec()
+        if not is_runaway_repetition_transcript(stripped, audio_sec):
+            return
+        candidate = self._input_transcript_text.strip()
+        if (
+            self._input_transcript_completed
+            and candidate
+            and not is_runaway_repetition_transcript(candidate, audio_sec)
+        ):
+            logger.warning(
+                "Repeat-loop output at finalize (%s); replacing it with the "
+                "completed input transcript (emitted_len=%d fallback_len=%d "
+                "audio_sec=%.2f)",
+                reason,
+                len(stripped),
+                len(candidate),
+                audio_sec,
+            )
+            await self._replace_emitted_text(candidate, None, finalizing=True)
+            return
+        logger.warning(
+            "Repeat-loop output at finalize (%s) and no completed transcript can "
+            "stand in (completed=%s fallback_len=%d emitted_len=%d "
+            "audio_sec=%.2f); marking turn incomplete",
+            reason,
+            self._input_transcript_completed,
+            len(candidate),
+            len(stripped),
+            audio_sec,
+        )
+        await self._replace_emitted_text(INCOMPLETE_TURN_MARKER, None, finalizing=True)
+
+    async def _replace_emitted_text(
+        self, text: str, turn_token, *, finalizing: bool = False
+    ) -> bool:
+        """Replace the whole turn output via isNewResponse=True; False when the
+        turn is already finalized or superseded. ``finalizing`` is only for
+        _finalize_turn itself, which owns the turn until it sends idle."""
         # A concurrent _finalize_turn (reachable via a provider `error`) may have
         # sent status:idle and cleared _active_turn_id while we awaited the
         # answer-guard similarity diffs off the event loop above. Re-check the
         # same lifecycle guard used before the barrier so a replacement never
         # lands after this turn's single idle (task 0436 S1 R6 mid-guard).
-        if self._finalized or self._is_stale_turn(turn_token):
-            return
+        if (self._finalized and not finalizing) or self._is_stale_turn(turn_token):
+            return False
 
         # About to replace the whole stream via isNewResponse=True; drop the
         # corrector's held tail so finalize_turn's flush won't append it.
         self._homonym_corrector.reset()
+        self._new_item_prefix_buffer = None
 
         payload = {
             "type": "text",
-            "content": fallback_text,
+            "content": text,
             "isNewResponse": True,
         }
         if self._active_turn_id is not None:
             payload["turn_id"] = self._active_turn_id
         await self._websocket.send_text(json.dumps(payload, ensure_ascii=False))
-        self._emitted_text = fallback_text
-        logger.info(
-            "Applied input transcription fallback before finalize "
-            "(fallback_len=%d current_len=%d marker_seen=%s)",
-            len(fallback_text),
-            len(current_text),
-            self._marker_seen,
-        )
+        self._emitted_text = text
+        self._fallback_replaced = True
+        return True
 
     async def _on_response_created(self, data):
         if self._emitted_text:
@@ -1566,6 +1869,8 @@ class TurnSession:
             flushed = await self._flush_buffer()
             if flushed:
                 self._marker_seen = True
+        # The item ended while its text still looked like a marker start.
+        await self._flush_new_item_prefix_buffer()
         await self._flush_no_speech_prefix_guard()
 
     async def _on_response_done(self, data):
@@ -1579,6 +1884,16 @@ class TurnSession:
         # waits for when that event is queued just after response.done (task 0436
         # S1 R4). Decoupling keeps the dispatcher consuming so a late-but-within-
         # grace ASR still drives the replacement before the single idle.
+        response = data.get("response") if isinstance(data, dict) else None
+        status = response.get("status") if isinstance(response, dict) else None
+        if status in ("incomplete", "failed", "cancelled"):
+            self._response_incomplete_status = status
+            details = response.get("status_details")
+            logger.warning(
+                "response.done status=%s (details=%s); output may be cut short",
+                status,
+                json.dumps(details, ensure_ascii=False)[:200] if details else "n/a",
+            )
         await self._note_response_text_stream_complete("response.done", data)
         self._schedule_finalize("response.done")
 
@@ -1816,6 +2131,10 @@ class TurnSession:
             done_event = self._turn_done
             # Immediately stop accepting further audio for this turn
             self._is_recording = False
+            if self._config.input_agc_enabled and self._speech_agc.flush():
+                # An orphan half sample is never sent: the provider takes whole
+                # Int16 samples (StreamingSpeechAGC byte-stream contract).
+                logger.debug("Dropped a trailing half sample before commit")
             try:
                 await self._client.commit_audio()
                 logger.info("Audio committed, starting response...")
@@ -1855,6 +2174,11 @@ class TurnSession:
                 )
                 await self._finalize_turn("timeout")
 
+    def _outbound_audio(self, processed_audio: bytes) -> bytes:
+        if not self._config.input_agc_enabled:
+            return processed_audio
+        return self._speech_agc.process_chunk(processed_audio)
+
     async def _handle_audio_bytes(self, raw: bytes):
         """Process one inbound PCM chunk: account it, then forward or buffer.
 
@@ -1873,10 +2197,14 @@ class TurnSession:
             self._audio_cache.accumulate(processed_audio)
         if not self._openai_ready.is_set():
             logger.debug("Provider not ready, buffering audio chunk")
-            self._pending_audio_chunks.append(processed_audio)
+            outbound_audio = self._outbound_audio(processed_audio)
+            if outbound_audio:
+                self._pending_audio_chunks.append(outbound_audio)
         elif self._client and self._is_recording:
-            await self._client.send_audio(processed_audio)
-            logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
+            outbound_audio = self._outbound_audio(processed_audio)
+            if outbound_audio:
+                await self._client.send_audio(outbound_audio)
+                logger.debug(f"Sent audio chunk, size: {len(outbound_audio)} bytes")
         else:
             logger.debug("Received audio but client is not initialized")
 
@@ -1959,8 +2287,6 @@ class TurnSession:
         logger.info("WebSocket connection closed for /api/v1/ws")
 
 
-@app.websocket("/ws")
-@app.websocket("/api/v1/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     config = TurnSessionConfig.from_env()
@@ -1970,5 +2296,24 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         await session.close()
 
+
+def create_realtime_app() -> FastAPI:
+    """Create a FastAPI realtime transcription application instance."""
+    realtime_app = FastAPI()
+    realtime_app.add_api_route("/health", health_check, methods=["GET"])
+    for ws_path in ("/ws", "/api/v1/ws", "/ws/realtime"):
+        realtime_app.add_api_websocket_route(ws_path, websocket_endpoint)
+    return realtime_app
+
+
+app = create_realtime_app()
+
+
+def main() -> None:
+    port = int(os.getenv("MICWAVE_PORT", os.getenv("ECHOWAVE_ECHO_PORT", "23456")))
+    host = os.getenv("MICWAVE_HOST", "127.0.0.1")
+    uvicorn.run(app, host=host, port=port)
+
+
 if __name__ == '__main__':
-    uvicorn.run(app, host="127.0.0.1", port=23456)
+    main()

@@ -7,12 +7,12 @@ from typing import Optional, Callable, Dict, List
 import asyncio
 import itertools
 import os
-from prompts import get_realtime_prompt
-from config import (
+from .prompts import get_realtime_prompt
+from .config import (
     OPENAI_REALTIME_MODEL,
     BRAINWAVE_MAX_OUTPUT_TOKENS,
 )
-from realtime_client_base import RealtimeClientBase
+from .realtime_client_base import RealtimeClientBase
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

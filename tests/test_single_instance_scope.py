@@ -3,7 +3,7 @@
 import signal
 
 import launcher
-from whisper_backend import dotenv_loader
+from micwave_core import whisper_adapter as dotenv_loader
 
 
 def test_shell_command_matcher_accepts_only_echowave_launcher_path():
@@ -12,8 +12,8 @@ def test_shell_command_matcher_accepts_only_echowave_launcher_path():
         f"{launcher.PROJECT_DIR}/launcher.py"
     )
     old_whisper_app = (
-        "/opt/whisperwave-app/venv/bin/python "
-        "/opt/whisperwave-app/launcher.py"
+        "/opt/apps/WhisperWave/venv/bin/python "
+        "/opt/apps/WhisperWave/launcher.py"
     )
     bare_collision = "python launcher.py"
     assert launcher._command_matches_shell(own) is True
@@ -44,7 +44,7 @@ def test_stale_or_foreign_pid_file_is_never_signalled(monkeypatch):
     monkeypatch.setattr(
         launcher,
         "_pid_command",
-        lambda _pid: "/other/python /opt/whisperwave-app/launcher.py",
+        lambda _pid: "/other/python /opt/apps/WhisperWave/launcher.py",
     )
     monkeypatch.setattr(launcher.os, "kill", lambda pid, sig: signals.append((pid, sig)))
 

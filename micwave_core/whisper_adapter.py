@@ -1,35 +1,26 @@
-"""OpenAI Realtime transcription-session client (WhisperWave).
-
-Connects to the same GA Realtime WebSocket endpoint as MicWave but drives a
-`type:"transcription"` session (gpt-4o-transcribe by default) instead of a conversation
-session. Structural differences vs MicWave's OpenAIRealtimeAudioTextClient:
-
-  * session.update payload is `{type:"transcription", audio:{input:{...}}}` with
-    no instructions/tools/response face and `turn_detection: null` (WhisperWave
-    uses explicit stop/commit).
-  * compatible transcription models receive one vocabulary-bias prompt when a
-    provider session is created; the prompt cannot create an answer surface.
-  * there is no `start_response()`; committing the buffer triggers transcription
-    directly and the server listens to
-    conversation.item.input_audio_transcription.delta/.completed.
-
-The session.created (connect) and session.updated (config-applied) confirmations
-keep MicWave's fail-closed semantics: on a missing/unexpected frame we resend
-once and then abort so the caller rebuilds a clean session rather than recording
-against an unconfigured session.
+"""WhisperWave sidecar building blocks: dotenv loader, silence-aligned soft
+segmentation, and OpenAI ``type:"transcription"`` WebSocket client.
 """
+
+from __future__ import annotations
+
 import asyncio
 import base64
 import hashlib
 import json
 import logging
+import math
 import os
+import sys
 import time
+from dataclasses import dataclass
 from typing import List, Optional
 
+import numpy as np
 import websockets
 
 from .config import (
+    DEFAULT_WHISPER_TRANSCRIBE_MODEL,
     WHISPER_TRANSCRIBE_MODEL,
     WHISPERWAVE_DELAY,
     WHISPERWAVE_INPUT_SAMPLE_RATE,
@@ -37,16 +28,209 @@ from .config import (
     WHISPERWAVE_NOISE_REDUCTION,
     transcription_delay_for_model,
 )
+from .prompts import TRANSCRIPTION_BIAS_PROMPT, transcription_prompt_for_model
 from .realtime_client_base import RealtimeClientBase
-from .transcription_prompt import (
-    TRANSCRIPTION_BIAS_PROMPT,
-    transcription_prompt_for_model,
-)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+# ── Allowlisted, space-preserving, secret-safe sidecar dotenv loader ──
+DOTENV_ALLOWED_KEYS = frozenset(
+    {
+        "WHISPERWAVE_DEBUG_LOG",
+        "WHISPERWAVE_DELAY",
+        "WHISPERWAVE_FORCE_RECONNECT_AFTER_MS",
+        "WHISPERWAVE_KEEP_PROVIDER_SESSION",
+        "WHISPERWAVE_LANGUAGE",
+        "WHISPERWAVE_MAX_TURN_AUDIO_BYTES",
+        "WHISPERWAVE_MODALITIES",
+        "WHISPERWAVE_MODEL",
+        "WHISPERWAVE_NOISE_REDUCTION",
+        "WHISPERWAVE_PORT",
+        "WHISPERWAVE_PROVIDER_EVENT_METRICS",
+        "WHISPERWAVE_PROVIDER_INIT_MAX_ATTEMPTS",
+        "WHISPERWAVE_PROVIDER_INIT_RETRY_DELAY_SEC",
+        "WHISPERWAVE_PROVIDER_SESSION_MAX_AGE_SEC",
+        "WHISPERWAVE_PROVIDER_SESSION_MAX_TURNS",
+        "WHISPERWAVE_SERVER_AUDIO_CACHE_DIR",
+        "WHISPERWAVE_SERVER_AUDIO_CACHE_ENABLED",
+        "WHISPERWAVE_SERVER_AUDIO_CACHE_LIMIT",
+        "WHISPERWAVE_SERVER_AUDIO_FILENAME_PREFIX",
+        "WHISPERWAVE_SOFT_SEGMENT_GRACE_SEC",
+        "WHISPERWAVE_SOFT_SEGMENT_SEC",
+        "WHISPERWAVE_SOFT_SEGMENT_SILENCE_RMS",
+        "WHISPERWAVE_TRANSCRIPTION_ACK_GRACE_SEC",
+        "WHISPERWAVE_TRANSCRIPTION_FAILURE_ROTATE_THRESHOLD",
+        "WHISPERWAVE_TRANSCRIPTION_FINALIZE_TIMEOUT_SEC",
+        "WHISPERWAVE_VERBOSE_SERVER_LOG",
+    }
+)
+
+
+def parse_env_file(path) -> list[tuple[str, str]]:
+    """Return allowlist-filtered ``(key, value)`` pairs preserving inner spaces."""
+    pairs: list[tuple[str, str]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export ") :].lstrip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                if key not in DOTENV_ALLOWED_KEYS:
+                    continue
+                pairs.append((key, value))
+    except FileNotFoundError:
+        pass
+    return pairs
+
+
+def load_into_environ(path, override: bool = False) -> list[str]:
+    """Load allowlisted keys without overwriting already-set environment keys."""
+    del override
+    loaded: list[str] = []
+    for key, value in parse_env_file(path):
+        if key in os.environ:
+            continue
+        os.environ[key] = value
+        loaded.append(key)
+    return loaded
+
+
+def _emit_shell(path) -> None:
+    for key, value in parse_env_file(path):
+        sys.stdout.write(f"{key}={value}\n")
+
+
+# ── Silence-aligned soft segment boundary tracker ──
+WINDOW_MS = 20
+MIN_SILENCE_MS = 300
+DEFAULT_SILENCE_RMS = 150.0
+MAX_SILENCE_RMS = 32_768.0
+MAX_SEGMENT_SEC = 86_400.0
+DEFAULT_SOFT_SEGMENT_SEC = 60.0
+DEFAULT_SOFT_GRACE_SEC = 30.0
+
+
+def window_bytes(sample_rate: int, window_ms: int = WINDOW_MS) -> int:
+    return max(1, sample_rate * window_ms // 1000) * 2
+
+
+def _is_finite_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+@dataclass(frozen=True)
+class SoftSegmentThresholds:
+    soft_bytes: int
+    force_bytes: int
+    min_silence_bytes: int
+    rms_threshold: float
+
+    def reason(self, segment_bytes: int, quiet_run_bytes: int) -> Optional[str]:
+        if segment_bytes < self.soft_bytes:
+            return None
+        if quiet_run_bytes >= self.min_silence_bytes:
+            return "silence"
+        if segment_bytes >= self.force_bytes:
+            return "forced"
+        return None
+
+
+def resolve_soft_segment_thresholds(
+    *,
+    soft_sec,
+    grace_sec,
+    rms_threshold,
+    bytes_per_sec: int,
+    min_commit_bytes: int,
+    hard_cap_bytes: int,
+) -> Optional[SoftSegmentThresholds]:
+    if not _is_finite_number(soft_sec):
+        logger.warning("Soft segment target %r is not a finite number; disabled", soft_sec)
+        return None
+    if soft_sec <= 0:
+        return None
+    if soft_sec > MAX_SEGMENT_SEC:
+        logger.warning(
+            "Soft segment target %r s exceeds %.0f s; disabled", soft_sec, MAX_SEGMENT_SEC
+        )
+        return None
+    if not _is_finite_number(grace_sec) or not 0 <= grace_sec <= MAX_SEGMENT_SEC:
+        logger.warning(
+            "Soft segment grace %r s is out of range; using %.0f s",
+            grace_sec,
+            DEFAULT_SOFT_GRACE_SEC,
+        )
+        grace_sec = DEFAULT_SOFT_GRACE_SEC
+    if not _is_finite_number(rms_threshold) or not 0 < rms_threshold <= MAX_SILENCE_RMS:
+        logger.warning(
+            "Soft segment silence RMS %r is out of range; using %.0f",
+            rms_threshold,
+            DEFAULT_SILENCE_RMS,
+        )
+        rms_threshold = DEFAULT_SILENCE_RMS
+
+    soft_bytes = int(soft_sec * bytes_per_sec) // 2 * 2
+    if soft_bytes < min_commit_bytes:
+        logger.info(
+            "Soft segment target %.3f s is below the %d-byte provider minimum; "
+            "raised to the minimum",
+            soft_sec,
+            min_commit_bytes,
+        )
+        soft_bytes = min_commit_bytes
+    if soft_bytes >= hard_cap_bytes:
+        return None
+    return SoftSegmentThresholds(
+        soft_bytes=soft_bytes,
+        force_bytes=soft_bytes + int(grace_sec * bytes_per_sec) // 2 * 2,
+        min_silence_bytes=MIN_SILENCE_MS * bytes_per_sec // 1000,
+        rms_threshold=float(rms_threshold),
+    )
+
+
+class QuietRunTracker:
+    """Track trailing run of consecutive quiet windows in a PCM16 stream."""
+
+    def __init__(self, *, sample_rate: int, rms_threshold: float = DEFAULT_SILENCE_RMS):
+        if not _is_finite_number(rms_threshold) or not 0 < rms_threshold <= MAX_SILENCE_RMS:
+            raise ValueError(
+                f"rms_threshold must be in (0, {MAX_SILENCE_RMS:.0f}], got {rms_threshold!r}"
+            )
+        self._window_bytes = window_bytes(sample_rate)
+        self._threshold_sq = float(rms_threshold) ** 2
+        self._carry = b""
+        self.run_bytes = 0
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        data = self._carry + chunk if self._carry else chunk
+        windows = len(data) // self._window_bytes
+        usable = windows * self._window_bytes
+        self._carry = bytes(data[usable:])
+        if not windows:
+            return
+        samples = np.frombuffer(data, dtype="<i2", count=usable // 2)
+        energy = (samples.reshape(windows, -1).astype(np.float64) ** 2).mean(axis=1)
+        loud = np.flatnonzero(energy >= self._threshold_sq)
+        if loud.size == 0:
+            self.run_bytes += usable
+        else:
+            self.run_bytes = (windows - 1 - int(loud[-1])) * self._window_bytes
+
+
+# ── OpenAI Realtime transcription-session client ──
 class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
     def __init__(
         self,
@@ -65,14 +249,6 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         self.language = language
         self.noise_reduction = noise_reduction
         self.input_sample_rate = input_sample_rate
-        # GA transcription sessions connect with ?intent=transcription. The GA
-        # endpoint REQUIRES a query param: a bare connect returns
-        # invalid_request_error/missing_model, and ?model=gpt-realtime-whisper is
-        # rejected as invalid_model (grw is not a conversation URL model).
-        # ?intent=transcription yields session.created then, after our
-        # session.update, session.updated. (Verified against the live API
-        # 2026-07-12; the model itself is selected inside the transcription
-        # config, not the URL.)
         self.base_url = "wss://api.openai.com/v1/realtime"
         self.connect_url = f"{self.base_url}?intent=transcription"
         self._last_send_error_log: float = 0
@@ -91,7 +267,6 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         return hashlib.sha256(str(item_id).encode("utf-8")).hexdigest()[:10]
 
     def _log_provider_event_metric(self, data: dict) -> None:
-        """Log provider ordering/size metadata without frame or transcript text."""
         if not self._provider_event_metrics or not isinstance(data, dict):
             return
         self._provider_event_seq += 1
@@ -119,7 +294,6 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         audio_input: dict = {
             "format": {"type": "audio/pcm", "rate": self.input_sample_rate},
             "transcription": transcription,
-            # Product contract: explicit stop commits the buffered utterance.
             "turn_detection": None,
         }
         if self.noise_reduction:
@@ -131,20 +305,13 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         modalities: List[str] = None,
         instructions: Optional[str] = None,
     ):
-        """Connect and configure a transcription session.
-
-        modalities/instructions are accepted for interface parity with the base
-        class but ignored — a transcription session has neither.
-        """
+        del modalities, instructions
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
             self.ws = await websockets.connect(self.connect_url, extra_headers=headers)
         except TypeError:
-            # Newer websockets uses 'additional_headers'
             self.ws = await websockets.connect(self.connect_url, additional_headers=headers)
 
-        # Wait for the initial session.created frame (the Realtime endpoint always
-        # creates a session on connect, then we switch it to transcription).
         try:
             response = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
         except asyncio.TimeoutError:
@@ -158,18 +325,18 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         response_data = json.loads(response)
         first_frame_type = response_data.get("type")
         if first_frame_type != "session.created":
-            # Fail-closed on an unexpected first frame. Log only redacted error
-            # metadata, never a full body that could carry transcript text.
             if first_frame_type == "error":
                 err = response_data.get("error", {})
                 logger.error(
                     "OpenAI connect: first frame is an error (type=%s code=%s) — aborting",
-                    err.get("type", "unknown"), err.get("code", "unknown"),
+                    err.get("type", "unknown"),
+                    err.get("code", "unknown"),
                 )
             else:
                 logger.error(
                     "OpenAI connect: unexpected first frame type=%r (expected "
-                    "session.created) — aborting connect", first_frame_type,
+                    "session.created) — aborting connect",
+                    first_frame_type,
                 )
             try:
                 await asyncio.wait_for(self.ws.close(), timeout=5.0)
@@ -195,21 +362,22 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
             self.language or "(auto)",
             self.noise_reduction or "(off)",
         )
-        await self.ws.send(json.dumps({
-            "type": "session.update",
-            "session": session_config_payload,
-        }, ensure_ascii=False))
+        await self.ws.send(
+            json.dumps(
+                {"type": "session.update", "session": session_config_payload},
+                ensure_ascii=False,
+            )
+        )
 
-        # Wait for session.updated so the transcription config is active before
-        # any audio is forwarded. On timeout, resend once; still failing → abort
-        # so the caller rebuilds a clean session (fail-closed).
         confirmed = await self._recv_session_updated(timeout=5.0)
         if not confirmed:
             logger.warning("session.updated not confirmed; resending session.update once")
-            await self.ws.send(json.dumps({
-                "type": "session.update",
-                "session": session_config_payload,
-            }, ensure_ascii=False))
+            await self.ws.send(
+                json.dumps(
+                    {"type": "session.update", "session": session_config_payload},
+                    ensure_ascii=False,
+                )
+            )
             confirmed = await self._recv_session_updated(timeout=5.0)
         if not confirmed:
             logger.error(
@@ -228,12 +396,6 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         self.receive_task = asyncio.create_task(self.receive_messages())
 
     async def _recv_session_updated(self, timeout: float) -> bool:
-        """Read frames until session.updated arrives or timeout elapses.
-
-        Used during connect() before the receive loop starts. Interleaved
-        non-session.updated frames are ignored; an error frame short-circuits to
-        a negative result.
-        """
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -254,7 +416,8 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
                 err = frame.get("error", {}) if isinstance(frame, dict) else {}
                 logger.error(
                     "Received error while awaiting session.updated (type=%s code=%s)",
-                    err.get("type", "unknown"), err.get("code", "unknown"),
+                    err.get("type", "unknown"),
+                    err.get("code", "unknown"),
                 )
                 return False
             logger.debug("Ignoring %s while awaiting session.updated", frame_type)
@@ -264,12 +427,6 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         session_config_payload: dict,
         timeout: float,
     ) -> bool:
-        """Send session.update and wait for session.updated via a temp handler.
-
-        The receive loop is already consuming frames, so we hook session.updated
-        with a temporary handler that sets an Event, then always restore the
-        original handler. Returns True iff confirmation arrived within timeout.
-        """
         session_updated_event = asyncio.Event()
         original_handler = self.handlers.get("session.updated")
 
@@ -283,10 +440,12 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
 
         self.handlers["session.updated"] = _on_session_updated
         try:
-            await self.ws.send(json.dumps({
-                "type": "session.update",
-                "session": session_config_payload,
-            }, ensure_ascii=False))
+            await self.ws.send(
+                json.dumps(
+                    {"type": "session.update", "session": session_config_payload},
+                    ensure_ascii=False,
+                )
+            )
             logger.info("Refreshed transcription session configuration via session.update")
             await asyncio.wait_for(session_updated_event.wait(), timeout=timeout)
             return True
@@ -304,6 +463,7 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         modalities: List[str] = None,
         instructions: Optional[str] = None,
     ):
+        del modalities, instructions
         if not self._is_ws_open():
             raise RuntimeError("WebSocket is not open. Cannot refresh transcription session.")
 
@@ -311,7 +471,9 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
         confirmed = await self._send_session_update_and_wait(session_config_payload, timeout=5.0)
         if not confirmed:
             logger.warning("session.updated not confirmed on refresh; resending once")
-            confirmed = await self._send_session_update_and_wait(session_config_payload, timeout=5.0)
+            confirmed = await self._send_session_update_and_wait(
+                session_config_payload, timeout=5.0
+            )
         if not confirmed:
             logger.error(
                 "session.updated not confirmed after refresh resend; forcing rebuild"
@@ -329,43 +491,40 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
                 if handler:
                     await handler(data)
                 else:
-                    logger.warning(f"No handler for message type: {message_type}")
+                    logger.warning("No handler for message type: %s", message_type)
         except websockets.exceptions.ConnectionClosed as e:
-            logger.error(f"OpenAI WebSocket connection closed: {e}")
+            logger.error("OpenAI WebSocket connection closed: %s", e)
         except asyncio.CancelledError:
             logger.info("OpenAI receive_messages task cancelled")
-            return  # don't fire on_disconnect for intentional cancellation
+            return
         except Exception as e:
-            logger.error(f"Error in receive_messages: {e}", exc_info=True)
+            logger.error("Error in receive_messages: %s", e, exc_info=True)
         await self._fire_on_disconnect()
 
     async def default_handler(self, data: dict):
         message_type = data.get("type", "unknown")
-        logger.warning(f"Unhandled message type received from OpenAI: {message_type}")
+        logger.warning("Unhandled message type received from OpenAI: %s", message_type)
 
     async def send_audio(self, audio_data: bytes) -> bool:
-        """Append PCM16 audio to the provider input buffer.
-
-        Returns True iff the frame was actually sent. Returns False when the WS
-        is not open so the caller can BUFFER the frame to conserve it (task
-        0446) rather than treat a not-open send as delivered and lose it — this
-        is the send-side half of the first-utterance loss fix.
-        """
         if self._is_ws_open():
-            await self.ws.send(json.dumps({
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(audio_data).decode("utf-8"),
-            }))
+            await self.ws.send(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(audio_data).decode("utf-8"),
+                    }
+                )
+            )
             return True
         now = time.time()
         if now - self._last_send_error_log >= 5.0:
-            logger.error("WebSocket is not open. Cannot send audio. (suppressing repeats for 5s)")
+            logger.error(
+                "WebSocket is not open. Cannot send audio. (suppressing repeats for 5s)"
+            )
             self._last_send_error_log = now
         return False
 
     async def commit_audio(self):
-        """Commit the audio buffer. Triggers transcription; creates a user item
-        but NOT a response (transcription sessions have no response surface)."""
         self._require_ws_open()
         await self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         logger.info("Sent input_audio_buffer.commit to OpenAI (transcription trigger)")
@@ -392,3 +551,27 @@ class WhisperRealtimeTranscriptionClient(RealtimeClientBase):
                 pass
             self.ws = None
             logger.info("Closed OpenAI transcription WebSocket connection")
+
+
+__all__ = [
+    "DEFAULT_SILENCE_RMS",
+    "DEFAULT_SOFT_GRACE_SEC",
+    "DEFAULT_SOFT_SEGMENT_SEC",
+    "DEFAULT_WHISPER_TRANSCRIBE_MODEL",
+    "DOTENV_ALLOWED_KEYS",
+    "MAX_SEGMENT_SEC",
+    "MAX_SILENCE_RMS",
+    "MIN_SILENCE_MS",
+    "QuietRunTracker",
+    "SoftSegmentThresholds",
+    "TRANSCRIPTION_BIAS_PROMPT",
+    "WHISPER_TRANSCRIBE_MODEL",
+    "WINDOW_MS",
+    "WhisperRealtimeTranscriptionClient",
+    "_emit_shell",
+    "load_into_environ",
+    "parse_env_file",
+    "resolve_soft_segment_thresholds",
+    "transcription_prompt_for_model",
+    "window_bytes",
+]

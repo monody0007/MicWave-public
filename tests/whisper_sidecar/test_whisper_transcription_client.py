@@ -11,12 +11,9 @@ import sys
 
 import pytest
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-from whisper_backend import whisper_realtime_client as wc
-from whisper_backend.whisper_realtime_client import WhisperRealtimeTranscriptionClient
+from micwave_core import whisper_adapter as wc
+from micwave_core.whisper_adapter import WhisperRealtimeTranscriptionClient
 
 
 class _SendWS:

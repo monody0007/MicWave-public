@@ -3,12 +3,8 @@ import pathlib
 import sys
 
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from whisper_backend import audio_persistence
-from whisper_backend.audio_persistence import TurnAudioCache
+from micwave_core import audio_persistence
+from micwave_core.audio_persistence import WhisperTurnAudioCache as TurnAudioCache
 
 
 class _NoopThread:

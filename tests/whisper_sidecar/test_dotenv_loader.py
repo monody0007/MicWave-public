@@ -1,18 +1,15 @@
 """dotenv loader tests (task 0436 Phase 2 R2, H4/M2).
 
 The loader must preserve spaces, refuse secrets, honor an allowlist, and never
-overwrite an already-set variable (so an environment-injected OPENAI_API_KEY wins over
+overwrite an already-set variable (so the GCP-injected OPENAI_API_KEY wins over
 a local placeholder — the H4 second-run bug).
 """
 import os
 import pathlib
 import sys
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-from whisper_backend import dotenv_loader
+from micwave_core import whisper_adapter as dotenv_loader
 
 CACHE_DIR_WITH_SPACES = "~/Library/Application Support/EchoWave/whisper/recent_audio"
 
@@ -52,10 +49,10 @@ def test_allowlist_rejects_foreign_prefixes(tmp_path):
 
 
 def test_existing_value_wins_even_when_legacy_override_is_requested(tmp_path, monkeypatch):
-    monkeypatch.setenv("WHISPERWAVE_DELAY", "RUNTIME_SENTINEL")
+    monkeypatch.setenv("WHISPERWAVE_DELAY", "GCP_RUNTIME_SENTINEL")
     path = _write_env(tmp_path, "WHISPERWAVE_DELAY=placeholder_from_env\n")
     loaded = dotenv_loader.load_into_environ(path, override=True)
-    assert os.environ["WHISPERWAVE_DELAY"] == "RUNTIME_SENTINEL"
+    assert os.environ["WHISPERWAVE_DELAY"] == "GCP_RUNTIME_SENTINEL"
     assert "WHISPERWAVE_DELAY" not in loaded
 
 

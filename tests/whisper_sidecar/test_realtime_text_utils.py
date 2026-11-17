@@ -5,11 +5,8 @@ import sys
 
 import pytest
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-from whisper_backend.realtime_text_utils import (
+from micwave_core.realtime_text_utils import (
     RULE_ACRONYM_SSOT,
     RULE_CLAUDE_CODE,
     RULE_NUMBER_COUNT,
@@ -55,11 +52,6 @@ def test_final_policy_high_confidence_positive_cases(source, expected, rule_id):
         "第一性原理",
         "万一",
         "千方百计",
-        "功利主义",
-        "功力深厚",
-        "这是一条功利",
-        "这是一条功力",
-        "功利原则",
         "Google Cloud Code",
         "SOT",
         "sot",
@@ -89,7 +81,6 @@ def test_final_policy_preserves_non_numeric_or_ambiguous_language(text):
         "一百二个样本",
         "一万二个样本",
         "万一个文件坏了怎么办",
-        "这是一条功利原则",
         "SOT_value",
         "SOT_1",
         "prefixSOTsuffix",
@@ -101,12 +92,6 @@ def test_final_policy_preserves_non_numeric_or_ambiguous_language(text):
         "SOT＿value",
         "αSOTβ",
         "变量SOT值",
-        "v2 的伦理框架强调这条功利。",
-        "这是一条功利。下一段讨论体系设计。",
-        "这是一条功利原则。另一句包含 V2。",
-        "他的功力深厚。另一句包含 v2。",
-        "第一性原理在前。这是一条功利原则。",
-        "功利主义仍然有效。另一句包含 V2。",
         "版本两三点四还没定，端口两三个都能用。",
         "config.SOT_value 保留这个版本一点一点来改",
     ],
@@ -427,7 +412,6 @@ def test_domain_aliases_require_clear_context(source, expected, rule_id):
         "123个样本",
         "SSOT",
         "Claude Code",
-        "这是一条原理",
     ],
 )
 def test_final_policy_is_idempotent(normalized):

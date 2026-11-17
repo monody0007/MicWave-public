@@ -11,12 +11,9 @@ import sys
 
 import pytest
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-import openai_realtime_client as oai
-from openai_realtime_client import OpenAIRealtimeAudioTextClient
+from micwave_core import openai_realtime_client as oai
+from micwave_core.openai_realtime_client import OpenAIRealtimeAudioTextClient
 
 
 class _SendWS:
@@ -179,6 +176,7 @@ async def test_start_response_omits_output_cap_when_unset(monkeypatch):
     client = _make_client()
     client.ws = _SendWS()
     monkeypatch.setattr(oai, "BRAINWAVE_MAX_OUTPUT_TOKENS", None)
+    client._turn_item_id = "item_1"  # as left by a successful commit_audio()
     await client.start_response("please transcribe")
     sent = json.loads(client.ws.sent[-1])
     assert sent["type"] == "response.create"
@@ -191,6 +189,7 @@ async def test_start_response_includes_valid_output_cap(monkeypatch):
     client = _make_client()
     client.ws = _SendWS()
     monkeypatch.setattr(oai, "BRAINWAVE_MAX_OUTPUT_TOKENS", 512)
+    client._turn_item_id = "item_1"  # as left by a successful commit_audio()
     await client.start_response("please transcribe")
     sent = json.loads(client.ws.sent[-1])
     assert sent["response"]["max_output_tokens"] == 512
@@ -198,7 +197,7 @@ async def test_start_response_includes_valid_output_cap(monkeypatch):
 
 
 def test_config_optional_int_in_range_validates_bounds(monkeypatch):
-    from config import _optional_int_in_range
+    from micwave_core.config import _optional_int_in_range
 
     monkeypatch.setenv("MW_TEST_TOK", "512")
     assert _optional_int_in_range("MW_TEST_TOK", 1, 4096) == 512
@@ -219,6 +218,6 @@ def test_config_optional_int_in_range_validates_bounds(monkeypatch):
 def test_no_temperature_pipeline_remains():
     # GA Realtime has no temperature field (task 0436 M7): the whole pipeline is
     # gone from config and the client module.
-    import config
+    from micwave_core import config
     assert not hasattr(config, "BRAINWAVE_TEMPERATURE")
     assert not hasattr(oai, "BRAINWAVE_TEMPERATURE")

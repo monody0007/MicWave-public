@@ -4,11 +4,7 @@ import pathlib
 import sys
 
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from whisper_backend import config  # noqa: E402
+from micwave_core import config  # noqa: E402
 
 
 def test_transcription_model_default_and_env_override(monkeypatch):

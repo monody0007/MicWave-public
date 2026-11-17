@@ -1,4 +1,4 @@
-import ast
+import asyncio
 from pathlib import Path
 
 from backend_runtime import (
@@ -8,7 +8,7 @@ from backend_runtime import (
     WIRE_CONTRACT_VERSION,
     build_default_descriptors,
 )
-from whisper_backend import realtime_server
+from micwave_core import whisper_server
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,27 +21,6 @@ def test_whisper_sidecar_has_no_desktop_owner_artifacts_or_dependencies():
     requirements = (SIDECAR_ROOT / "requirements.txt").read_text(encoding="utf-8")
     for forbidden in ("pyaudio", "rumps", "Quartz", "pynput"):
         assert forbidden not in requirements
-
-
-def test_whisper_provider_modules_use_package_relative_internal_imports():
-    internal = {
-        "audio_persistence",
-        "config",
-        "dotenv_loader",
-        "realtime_client_base",
-        "realtime_server",
-        "realtime_text_utils",
-        "transcript_merge",
-        "transcription_prompt",
-        "whisper_realtime_client",
-    }
-    for path in SIDECAR_ROOT.glob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                assert not any(alias.name in internal for alias in node.names), path
-            if isinstance(node, ast.ImportFrom) and node.module in internal:
-                assert node.level > 0, path
 
 
 def test_default_descriptors_lock_ports_and_separate_runtime_pid_log(tmp_path):
@@ -60,13 +39,25 @@ def test_default_descriptors_lock_ports_and_separate_runtime_pid_log(tmp_path):
     assert echo.provider != whisper.provider
     assert echo.model != whisper.model
     assert echo.command[1].endswith("echo_backend_entry.py")
+    assert whisper.command[1:] == ("-m", "micwave_core.whisper_server")
 
 
 def test_whisper_health_is_versioned_and_backend_identified():
-    payload = __import__("asyncio").run(realtime_server.health_check())
+    payload = asyncio.run(whisper_server.health_check())
     assert payload["status"] == "ok"
     assert payload["backend"] == BACKEND_WHISPER
     assert payload["contract"] == {
         "name": WIRE_CONTRACT_NAME,
         "version": WIRE_CONTRACT_VERSION,
     }
+
+
+def test_echo_desktop_contract_is_literal_echo(monkeypatch):
+    import echo_backend_entry
+    import launcher
+    from micwave_core import whisper_adapter
+
+    monkeypatch.setenv("ECHOWAVE_BACKEND_KEY", "retired_override_ignored")
+    payload = asyncio.run(echo_backend_entry.desktop_contract())
+    assert payload["backend"] == "echo"
+    assert launcher._WHISPER_DOTENV_ALLOWED_KEYS is whisper_adapter.DOTENV_ALLOWED_KEYS

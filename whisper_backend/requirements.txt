@@ -5,4 +5,3 @@ python-multipart
 numpy
 websockets<14
 scipy
-

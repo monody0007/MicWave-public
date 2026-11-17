@@ -71,20 +71,6 @@ class _MenuItem:
         self._menuitem.setState_(state)
 
 
-class _BackendSwitchViewDouble:
-    def __init__(self):
-        self.label = ""
-        self.enabled = None
-        self.dismiss_on_exit_armed = False
-
-    def setBackendLabel_enabled_(self, label, enabled):
-        self.label = str(label)
-        self.enabled = bool(enabled)
-
-    def setDismissOnExitArmed_(self, armed):
-        self.dismiss_on_exit_armed = bool(armed)
-
-
 class _DescriptorSupervisor:
     def __init__(self, descriptors):
         self.descriptors = descriptors
@@ -121,15 +107,36 @@ def _prime_lifecycle(app):
     app._switch_in_progress = False
 
 
+def _prime_backend_rows(app, descriptors):
+    """Stand up the header row plus one row per registered lane."""
+    app.backend_header_item = _MenuItem()
+    app.backend_row_items = {}
+    for key in ime_menubar.BACKEND_MENU_ORDER:
+        if key not in descriptors:
+            continue
+        item = _MenuItem()
+        item._backend_key = key
+        app.backend_row_items[key] = item
+    return app.backend_row_items
+
+
+def _checked_lane(app):
+    """The single lane carrying the check mark, or a failure if not single."""
+    checked = [
+        key for key, item in app.backend_row_items.items() if item.state == 1
+    ]
+    assert len(checked) == 1, checked
+    return checked[0]
+
+
 def _prime_backend_presentation(app):
-    app.backend_switch_item = _MenuItem()
-    app.backend_switch_view = _BackendSwitchViewDouble()
+    _prime_backend_rows(app, app._backend_supervisor.descriptors)
     app._sync_provider_menu = lambda: None
     app._sync_model_menu = lambda: None
     app._sync_status_menu = lambda _state: None
 
 
-def test_icons_hotkey_and_single_backend_switch_menu_state(tmp_path):
+def test_icons_hotkey_and_lane_row_menu_state(tmp_path):
     assert BrainwaveIMEApp.STATE_ICONS == {
         IMEState.IDLE: "🌊",
         IMEState.RECORDING: "🔵",
@@ -138,50 +145,46 @@ def test_icons_hotkey_and_single_backend_switch_menu_state(tmp_path):
     }
     assert Config().hotkey_keycode == 50
 
-    app = BrainwaveIMEApp.__new__(BrainwaveIMEApp)
-    app._backend_supervisor = _DescriptorSupervisor(
-        build_default_descriptors(
-            tmp_path,
-            app_support_dir=tmp_path / "runtime",
-            log_dir=tmp_path / "logs",
-            echo_python="/echo/python",
-            whisper_python="/whisper/python",
-        )
+    descriptors = build_default_descriptors(
+        tmp_path,
+        app_support_dir=tmp_path / "runtime",
+        log_dir=tmp_path / "logs",
+        echo_python="/echo/python",
+        whisper_python="/whisper/python",
     )
+    app = BrainwaveIMEApp.__new__(BrainwaveIMEApp)
+    app._backend_supervisor = _DescriptorSupervisor(descriptors)
     app._current_backend = BACKEND_ECHO
     app._switch_in_progress = False
-    app.backend_switch_item = _MenuItem()
-    app.backend_switch_view = _BackendSwitchViewDouble()
+    rows = _prime_backend_rows(app, descriptors)
+    # No sibling fork here, so the picker is the two lanes this repo owns.
+    assert list(rows) == [BACKEND_ECHO, BACKEND_WHISPER]
 
     app._sync_backend_menu(IMEState.IDLE)
-    assert app.backend_switch_item.title == "EchoWave"
-    assert app.backend_switch_item._menuitem.title == "EchoWave"
-    assert app.backend_switch_view.label == "EchoWave"
-    assert app.backend_switch_item.state == 0
-    assert app.backend_switch_item._menuitem.state == 0
-    assert app.backend_switch_item._menuitem.enabled is True
-    assert app.backend_switch_view.enabled is True
+    assert app.backend_header_item.title == "Using: EchoWave"
+    assert app.backend_header_item._menuitem.enabled is False
+    assert rows[BACKEND_ECHO].title == "EchoWave"
+    assert rows[BACKEND_WHISPER].title == "WhisperWave"
+    assert _checked_lane(app) == BACKEND_ECHO
+    assert rows[BACKEND_ECHO]._menuitem.enabled is False
+    assert rows[BACKEND_WHISPER]._menuitem.enabled is True
 
     app._current_backend = BACKEND_WHISPER
     app._sync_backend_menu(IMEState.DISCONNECTED)
-    assert app.backend_switch_item.title == "WhisperWave"
-    assert app.backend_switch_item._menuitem.title == "WhisperWave"
-    assert app.backend_switch_view.label == "WhisperWave"
-    assert app.backend_switch_item.state == 0
-    assert app.backend_switch_item._menuitem.state == 0
-    assert app.backend_switch_item._menuitem.enabled is True
+    assert app.backend_header_item.title == "Using: WhisperWave"
+    assert _checked_lane(app) == BACKEND_WHISPER
+    assert rows[BACKEND_WHISPER]._menuitem.enabled is False
+    assert rows[BACKEND_ECHO]._menuitem.enabled is True
 
-    app._sync_backend_menu(IMEState.RECORDING)
-    assert app.backend_switch_item._menuitem.enabled is False
-    assert app.backend_switch_view.label == "WhisperWave"
-    assert app.backend_switch_view.enabled is False
-    app._sync_backend_menu(IMEState.PROCESSING)
-    assert app.backend_switch_item._menuitem.enabled is False
-    assert app.backend_switch_view.label == "WhisperWave"
-    assert app.backend_switch_view.enabled is False
+    for state in (IMEState.RECORDING, IMEState.PROCESSING):
+        app._sync_backend_menu(state)
+        assert app.backend_header_item.title == "Using: WhisperWave", state
+        assert _checked_lane(app) == BACKEND_WHISPER, state
+        for key, item in rows.items():
+            assert item._menuitem.enabled is False, (state, key)
 
 
-def test_app_installs_backend_custom_view_as_first_menu_row_and_reuses_timer(
+def test_app_installs_header_then_lane_rows_as_the_first_menu_block(
     tmp_path,
     monkeypatch,
 ):
@@ -243,93 +246,27 @@ def test_app_installs_backend_custom_view_as_first_menu_row_and_reuses_timer(
     )
 
     native_menu = app.menu._menu
-    assert native_menu.itemAtIndex_(0) is app.backend_switch_item._menuitem
-    assert native_menu.itemAtIndex_(1) is app.status_item._menuitem
-    assert app.backend_switch_item.title == "EchoWave"
-    assert app.backend_switch_item._menuitem.title() == "EchoWave"
-    assert app.backend_switch_item._menuitem.state() == 0
-    assert app.backend_switch_item._menuitem.action() is None
-    assert app.backend_switch_item._menuitem.view() is app.backend_switch_view
-    assert app.backend_switch_view._label.stringValue() == "EchoWave"
+    # Header, then one row per lane, then the separator, then Status.
+    assert native_menu.itemAtIndex_(0) is app.backend_header_item._menuitem
+    assert list(app.backend_row_items) == [BACKEND_ECHO, BACKEND_WHISPER]
+    assert native_menu.itemAtIndex_(1) is app.backend_row_items[BACKEND_ECHO]._menuitem
+    assert (
+        native_menu.itemAtIndex_(2) is app.backend_row_items[BACKEND_WHISPER]._menuitem
+    )
+    assert native_menu.itemAtIndex_(3).isSeparatorItem()
+    assert native_menu.itemAtIndex_(4) is app.status_item._menuitem
+
+    assert app.backend_header_item.title == "Using: EchoWave"
+    assert app.backend_header_item._menuitem.title() == "Using: EchoWave"
+    assert app.backend_header_item._menuitem.isEnabled() is False
+    assert app.backend_row_items[BACKEND_ECHO]._menuitem.title() == "EchoWave"
+    assert app.backend_row_items[BACKEND_ECHO]._menuitem.state() == 1
+    assert app.backend_row_items[BACKEND_WHISPER]._menuitem.state() == 0
+    # The rows are ordinary command items again: real actions, no custom view.
+    assert app.backend_row_items[BACKEND_ECHO]._menuitem.view() is None
+    assert app.backend_row_items[BACKEND_WHISPER]._menuitem.action() is not None
     assert app._state_timer.start_calls == 1
     assert registered_timers == [app._state_timer]
-
-
-def test_backend_custom_view_click_schedules_one_switch_and_never_cancels_tracking(
-    tmp_path,
-):
-    descriptors = build_default_descriptors(
-        tmp_path,
-        app_support_dir=tmp_path / "runtime",
-        log_dir=tmp_path / "logs",
-        echo_python="/echo/python",
-        whisper_python="/whisper/python",
-    )
-    scheduled = []
-    cancellations = []
-
-    class FakeLoop:
-        def call_soon_threadsafe(self, callback):
-            scheduled.append(callback)
-
-    app = BrainwaveIMEApp.__new__(BrainwaveIMEApp)
-    app._backend_supervisor = _DescriptorSupervisor(descriptors)
-    app._current_backend = BACKEND_ECHO
-    app.backend_switch_item = ime_menubar.rumps.MenuItem("EchoWave", callback=None)
-    app.core = SimpleNamespace(state=IMEState.IDLE)
-    app.loop = FakeLoop()
-    app._sync_status_menu = lambda _state: None
-    app._cancel_backend_menu_tracking = lambda: cancellations.append(True)
-    _prime_lifecycle(app)
-    app._attach_backend_switch_view()
-    app._sync_backend_menu(IMEState.IDLE)
-
-    app.backend_switch_view.mouseUp_(None)
-    app.backend_switch_view.mouseUp_(None)
-
-    assert len(scheduled) == 1
-    assert app._active_lifecycle_kind == "switch"
-    assert app._current_backend == BACKEND_ECHO
-    assert app.backend_switch_item.title == "EchoWave"
-    assert app.backend_switch_view._label.stringValue() == "EchoWave"
-    assert app.backend_switch_view._interaction_enabled is False
-    assert cancellations == []
-
-
-def test_backend_custom_view_mouse_exit_dismisses_once_only_after_arm():
-    class FakeNativeMenu:
-        def __init__(self):
-            self.cancel_calls = 0
-
-        def cancelTrackingWithoutAnimation(self):
-            self.cancel_calls += 1
-
-    native_menu = FakeNativeMenu()
-    native_item = SimpleNamespace(menu=lambda: native_menu)
-    owner = BrainwaveIMEApp.__new__(BrainwaveIMEApp)
-    owner.backend_switch_item = SimpleNamespace(_menuitem=native_item)
-    owner._backend_switch_selected = lambda _sender: None
-    view = ime_menubar.BackendSwitchMenuView.alloc().initWithFrame_(
-        ((0.0, 0.0), (240.0, 24.0))
-    )
-    view.configureWithOwner_(owner)
-
-    view.mouseExited_(None)
-    assert native_menu.cancel_calls == 0
-
-    view.setDismissOnExitArmed_(True)
-    view.mouseExited_(None)
-    view.mouseExited_(None)
-    assert native_menu.cancel_calls == 1
-    assert view._dismiss_on_exit_armed is False
-
-    view.setDismissOnExitArmed_(False)
-    view.mouseExited_(None)
-    assert native_menu.cancel_calls == 1
-
-    view.setDismissOnExitArmed_(True)
-    view.viewDidMoveToWindow()
-    assert view._dismiss_on_exit_armed is False
 
 
 def test_tracking_mode_registration_reuses_started_native_timer_and_fails_loudly():
@@ -1077,12 +1014,10 @@ async def test_failed_target_connect_restores_real_core_and_keeps_ui_selection_a
         BACKEND_ECHO,
     ]
     assert supervisor.stopped == [BACKEND_WHISPER]
-    assert app.backend_switch_item.title == "EchoWave"
-    assert app.backend_switch_item._menuitem.title == "EchoWave"
-    assert app.backend_switch_view.label == "EchoWave"
-    assert app.backend_switch_item._menuitem.enabled is True
-    assert app.backend_switch_view.enabled is True
-    assert app.backend_switch_view.dismiss_on_exit_armed is False
+    assert app.backend_header_item.title == "Using: EchoWave"
+    assert _checked_lane(app) == BACKEND_ECHO
+    assert app.backend_row_items[BACKEND_ECHO]._menuitem.enabled is False
+    assert app.backend_row_items[BACKEND_WHISPER]._menuitem.enabled is True
     assert notifications and notifications[0][1] == "Backend operation failed"
 
 
@@ -1151,20 +1086,16 @@ async def test_old_cleanup_failure_keeps_core_selection_and_ui_committed_to_targ
     assert event[1] == BACKEND_WHISPER
     assert "injected old-child stop failure" in event[2]
     app._drain_backend_events()
-    assert app.backend_switch_item.title == "WhisperWave"
-    assert app.backend_switch_item._menuitem.title == "WhisperWave"
-    assert app.backend_switch_view.label == "WhisperWave"
-    assert app.backend_switch_item.state == 0
-    assert app.backend_switch_item._menuitem.enabled is True
-    assert app.backend_switch_view.enabled is True
-    assert app.backend_switch_view.dismiss_on_exit_armed is True
+    assert app.backend_header_item.title == "Using: WhisperWave"
+    assert _checked_lane(app) == BACKEND_WHISPER
+    assert app.backend_row_items[BACKEND_WHISPER]._menuitem.enabled is False
+    assert app.backend_row_items[BACKEND_ECHO]._menuitem.enabled is True
     assert {
-        app.backend_switch_view.label,
-        app.backend_switch_item._menuitem.title,
-        supervisor.descriptor(app._current_backend).label,
-        supervisor.descriptor(core.config.backend_key).label,
-        supervisor.descriptor(store.load()).label,
-    } == {"WhisperWave"}
+        app.backend_header_item._menuitem.title,
+        f"Using: {supervisor.descriptor(app._current_backend).label}",
+        f"Using: {supervisor.descriptor(core.config.backend_key).label}",
+        f"Using: {supervisor.descriptor(store.load()).label}",
+    } == {"Using: WhisperWave"}
     assert notifications and notifications[0][1] == "Backend switched with cleanup warning"
 
 
@@ -1353,8 +1284,7 @@ async def test_switch_barrier_rejects_reconnect_restart_and_stale_lifecycle_even
         descriptors[BACKEND_WHISPER].model: "Whisper model",
     }
     app.status_item = _MenuItem()
-    app.backend_switch_item = _MenuItem()
-    app.backend_switch_view = _BackendSwitchViewDouble()
+    _prime_backend_rows(app, descriptors)
     app.reconnect_item = _MenuItem()
     app.restart_item = _MenuItem()
     app.loop = FakeLoop()
@@ -1375,10 +1305,10 @@ async def test_switch_barrier_rejects_reconnect_restart_and_stale_lifecycle_even
     first_token = app._lifecycle_operation_generation
     app._sync_status_menu(IMEState.DISCONNECTED)
     app._sync_backend_menu(IMEState.DISCONNECTED)
-    assert app.backend_switch_item.title == "EchoWave"
-    assert app.backend_switch_view.label == "EchoWave"
-    assert app.backend_switch_item._menuitem.enabled is False
-    assert app.backend_switch_view.enabled is False
+    assert app.backend_header_item.title == "Using: EchoWave"
+    assert _checked_lane(app) == BACKEND_ECHO
+    for key, item in app.backend_row_items.items():
+        assert item._menuitem.enabled is False, key
     assert app.reconnect_item._menuitem.enabled is False
     assert app.restart_item._menuitem.enabled is False
 
@@ -1399,29 +1329,28 @@ async def test_switch_barrier_rejects_reconnect_restart_and_stale_lifecycle_even
     app._drain_backend_events()
     app._sync_status_menu(IMEState.DISCONNECTED)
     app._sync_backend_menu(IMEState.DISCONNECTED)
-    assert app.backend_switch_item.title == "WhisperWave"
-    assert app.backend_switch_view.label == "WhisperWave"
-    assert app.backend_switch_view.dismiss_on_exit_armed is True
-    assert app.backend_switch_item._menuitem.enabled is True
+    assert app.backend_header_item.title == "Using: WhisperWave"
+    assert _checked_lane(app) == BACKEND_WHISPER
+    assert app.backend_row_items[BACKEND_ECHO]._menuitem.enabled is True
     assert app.reconnect_item._menuitem.enabled is True
     assert app.restart_item._menuitem.enabled is True
 
     second_token = app._begin_lifecycle_operation("reconnect")
     assert second_token is not None and second_token > first_token
-    app._set_backend_switch_dismiss_armed(False)
     app._sync_backend_menu(IMEState.DISCONNECTED)
     # Reproduce the live symptom: a committed worker updated authority, but an
-    # older native label is still on screen when its lifecycle event goes stale.
-    app.backend_switch_item.title = "EchoWave"
-    app.backend_switch_view.label = "EchoWave"
+    # older header and check mark are still on screen when its lifecycle event
+    # goes stale.
+    app.backend_header_item.title = "Using: EchoWave"
+    app.backend_row_items[BACKEND_ECHO].state = 1
+    app.backend_row_items[BACKEND_WHISPER].state = 0
     app._backend_events.put(("switched", BACKEND_ECHO, None, first_token))
     app._drain_backend_events()
     assert app._current_backend == BACKEND_WHISPER
     assert app.core.config.backend_key == BACKEND_WHISPER
-    assert app.backend_switch_item.title == "WhisperWave"
-    assert app.backend_switch_item._menuitem.title == "WhisperWave"
-    assert app.backend_switch_view.label == "WhisperWave"
-    assert app.backend_switch_view.dismiss_on_exit_armed is False
+    assert app.backend_header_item.title == "Using: WhisperWave"
+    assert app.backend_header_item._menuitem.title == "Using: WhisperWave"
+    assert _checked_lane(app) == BACKEND_WHISPER
     app._finish_lifecycle_operation(second_token)
 
     restart_token = app._begin_lifecycle_operation("restart")
@@ -1468,9 +1397,475 @@ async def test_recording_state_accepts_streaming_deltas_after_segment_rollover()
     )
     assert core.transcript == "rollover前已提交文本rollover后段"
 
+
     # unrelated turn deltas still ignored
     await core._handle_message(
         {"type": "text", "content": "X", "turn_id": 32},
         connection_generation=1,
     )
     assert core.transcript == "rollover前已提交文本rollover后段"
+
+
+def _transcript_delivery_core():
+    """Logical desktop owner with every audio/clipboard/history sink replaced."""
+    core = BrainwaveIMECore.__new__(BrainwaveIMECore)
+    core.config = SimpleNamespace(stop_sound="none")
+    core._connection_generation = 1
+    core.state = IMEState.RECORDING
+    core._active_turn_id = 71
+    core._terminal_turn_ids = set()
+    core._failed_turn_ids = set()
+    core._audio_drop_count = 0
+    core._audio_ingestion_failed_reason = None
+    core._stop_pressed_ts = None
+    core._server_connected_event = asyncio.Event()
+    core._start_requested = True
+    core.recording_mode = RecordingMode.OPTIMIZED
+    core._active_turn_provider = "openai-transcription"
+    core._active_turn_model = "gpt-4o-transcribe"
+    core._active_turn_backend = BACKEND_WHISPER
+    core.transcript = ""
+    core.on_transcript = None
+    core._invalidate_recording_token = lambda: None
+    core._archive_recent_turn_audio = lambda _outcome: True
+    core._archive_failed_turn_audio = lambda _reason: None
+    core._play_sound = lambda _name: None
+    core._set_state = lambda state: setattr(core, "state", state)
+    core.pastes = []
+    core.completions = []
+    core.on_transcript_complete = lambda *args: core.completions.append(args)
+
+    async def input_text(text):
+        core.pastes.append(text)
+
+    async def async_stop():
+        pass
+
+    core._input_text = input_text
+    core._async_stop = async_stop
+    return core
+
+
+@pytest.mark.asyncio
+async def test_stop_preserves_streamed_turn_until_matching_terminal():
+    core = _transcript_delivery_core()
+    final = "A completed prefix followed by the unique ending."
+    await core._handle_message({"type": "text", "content": final, "turn_id": 71})
+    await core._stop_recording()
+    await core._handle_message({"type": "status", "status": "idle", "turn_id": 71})
+
+    assert core.pastes == [final]
+    assert [entry[0] for entry in core.completions] == [final]
+
+
+@pytest.mark.asyncio
+async def test_whisper_shell_preserves_repeated_delta_content_verbatim():
+    core = _transcript_delivery_core()
+    phrase = "Please repeat this. "
+    for _ in range(2):
+        await core._handle_message(
+            {"type": "text", "content": phrase, "turn_id": 71}
+        )
+    await core._handle_message(
+        {"type": "text", "content": "A unique ending.", "turn_id": 71}
+    )
+    assert core.transcript == phrase * 2 + "A unique ending."
+
+
+def test_event_tap_consumes_hotkey_autorepeat_without_scheduling_another_toggle(
+    monkeypatch,
+):
+    from Quartz import kCGKeyboardEventAutorepeat
+
+    callbacks = []
+    scheduled = []
+    nullified = []
+
+    class ImmediateThread:
+        def __init__(self, target, **kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    def create_tap(*args):
+        callbacks.append(args[4])
+        return object()
+
+    monkeypatch.setattr(ime_menubar.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(ime_menubar, "CGEventTapCreate", create_tap)
+    monkeypatch.setattr(ime_menubar, "CGEventTapEnable", lambda *_args: None)
+    monkeypatch.setattr(ime_menubar, "CFMachPortCreateRunLoopSource", lambda *_args: object())
+    monkeypatch.setattr(ime_menubar, "CFRunLoopGetCurrent", lambda: object())
+    monkeypatch.setattr(ime_menubar, "CFRunLoopAddSource", lambda *_args: None)
+    monkeypatch.setattr(ime_menubar, "CFRunLoopRun", lambda: None)
+    monkeypatch.setattr(ime_menubar, "CGEventGetIntegerValueField", lambda event, field: event[field])
+    monkeypatch.setattr(ime_menubar, "CGEventGetFlags", lambda event: event["flags"])
+    monkeypatch.setattr(ime_menubar, "CGEventSetType", lambda event, _kind: nullified.append(event))
+    app = BrainwaveIMEApp.__new__(BrainwaveIMEApp)
+    app.config = Config()
+    app.loop = SimpleNamespace(call_soon_threadsafe=scheduled.append)
+    app._start_event_tap()
+    assert len(callbacks) == 1
+
+    def press(repeat):
+        event = {
+            ime_menubar.kCGKeyboardEventKeycode: app.config.hotkey_keycode,
+            kCGKeyboardEventAutorepeat: repeat,
+            "flags": ime_menubar.kCGEventFlagMaskCommand,
+        }
+        assert callbacks[0](None, ime_menubar.kCGEventKeyDown, event, None) is event
+
+    press(0)
+    for _ in range(10):
+        press(1)
+    assert len(scheduled) == 1
+    assert len(nullified) == 11
+    press(0)  # A released-and-pressed key is the next intentional toggle.
+    assert len(scheduled) == 2
+
+
+@pytest.mark.parametrize("segment_count", [1, 3])
+@pytest.mark.parametrize("with_deltas", [False, True])
+@pytest.mark.asyncio
+async def test_whisper_segments_reach_desktop_as_one_complete_paste_and_history(
+    segment_count, with_deltas
+):
+    """Real sidecar rollover/stop output crosses the real desktop message path."""
+    from starlette.websockets import WebSocketState
+    from micwave_core.whisper_server import (
+        TranscriptionTurnSession,
+        TranscriptionTurnSessionConfig,
+    )
+
+    core = _transcript_delivery_core()
+
+    class DesktopSocket:
+        client_state = WebSocketState.CONNECTED
+
+        def __init__(self):
+            self.sent = []
+
+        async def send_text(self, raw):
+            payload = json.loads(raw)
+            self.sent.append(payload)
+            await core._handle_message(payload, connection_generation=1)
+
+    class Provider:
+        def __init__(self):
+            self.handlers = {}
+            self.sent_audio = []
+            self.committed = asyncio.Event()
+
+        def register_handler(self, name, callback):
+            self.handlers[name] = callback
+
+        def set_on_disconnect(self, callback):
+            self.on_disconnect = callback
+
+        def _is_ws_open(self):
+            return True
+
+        async def send_audio(self, chunk):
+            self.sent_audio.append(chunk)
+            return True
+
+        async def commit_audio(self):
+            self.committed.set()
+
+        async def clear_audio_buffer(self):
+            pass
+
+        async def close(self):
+            pass
+
+    socket = DesktopSocket()
+    frame_bytes = 4_800
+    config = TranscriptionTurnSessionConfig(
+        keep_provider_session=True,
+        provider_session_max_turns=8,
+        provider_session_max_age_sec=3300,
+        provider_init_max_attempts=1,
+        provider_init_retry_delay_sec=0,
+        transcription_finalize_timeout_sec=5,
+        transcription_ack_grace_sec=2,
+        transcription_failure_rotate_threshold=2,
+        default_source_sample_rate=24000,
+        max_turn_audio_bytes=frame_bytes * 2,
+    )
+    session = TranscriptionTurnSession(socket, config)
+    providers = [Provider() for _ in range(segment_count)]
+    replacements = iter(providers)
+
+    async def init_provider(**kwargs):
+        session._client = next(replacements)
+        session._provider_generation += 1
+        session._provider_audio_bytes = 0
+        session._begin_provider_epoch_locked()
+        session._register_client_handlers(session._client)
+        return True
+
+    session._init_or_reuse_client = init_provider
+    await session._handle_start_recording({"turn_id": 71, "input_sample_rate": 24000})
+    frames = [bytes([i + 1]) * frame_bytes for i in range(segment_count * 2)]
+    segment_texts = [f"Sentence for segment {i}. " for i in range(segment_count)]
+    segment_texts[-1] += "A unique ending."
+    cursor = 0
+
+    async def emit_segment(index):
+        provider = providers[index]
+        await asyncio.wait_for(provider.committed.wait(), 1)
+        item = f"delivery-item-{index}"
+        await provider.handlers["input_audio_buffer.committed"]({"item_id": item})
+        if with_deltas:
+            await provider.handlers["conversation.item.input_audio_transcription.delta"](
+                {"item_id": item, "event_id": f"delivery-event-{index}", "delta": segment_texts[index]}
+            )
+        await provider.handlers["conversation.item.input_audio_transcription.completed"](
+            {"item_id": item, "transcript": segment_texts[index]}
+        )
+
+    for index in range(segment_count - 1):
+        crossing = (index + 1) * 2
+        while cursor <= crossing:
+            await session._handle_audio_bytes(frames[cursor])
+            cursor += 1
+        await emit_segment(index)
+        rollover = session._segment_rollover_task
+        assert rollover is not None
+        await asyncio.wait_for(asyncio.shield(rollover), 1)
+        assert core.state == IMEState.RECORDING
+        assert core.pastes == [] and core.completions == []
+
+    while cursor < len(frames):
+        await session._handle_audio_bytes(frames[cursor])
+        cursor += 1
+    stop_task = None
+
+    async def async_stop():
+        nonlocal stop_task
+        stop_task = asyncio.create_task(session._handle_stop_recording({"turn_id": 71}))
+        await asyncio.sleep(0)
+
+    core._async_stop = async_stop
+    await core._stop_recording()
+    await emit_segment(segment_count - 1)
+    await asyncio.wait_for(stop_task, 1)
+    await core._handle_message({"type": "status", "status": "idle", "turn_id": 71})
+
+    expected = "".join(segment_texts)
+    assert [chunk for provider in providers for chunk in provider.sent_audio] == frames
+    assert core.pastes == [expected]
+    assert [entry[0] for entry in core.completions] == [expected]
+    assert core.state == IMEState.IDLE
+    assert len([p for p in socket.sent if p.get("status") == "idle"]) == 1
+    assert session._emitted_text == expected
+
+
+@pytest.mark.parametrize("stop_during_retry", [False, True])
+@pytest.mark.parametrize("retry_succeeds", [False, True])
+@pytest.mark.asyncio
+async def test_rollover_repetition_retry_has_one_terminal_desktop_owner(
+    stop_during_retry, retry_succeeds
+):
+    from dataclasses import replace
+    from starlette.websockets import WebSocketState
+    from micwave_core.whisper_server import TranscriptionTurnSession, TranscriptionTurnSessionConfig
+
+    core = _transcript_delivery_core()
+    archives, drains, notifications, restarts = [], [], [], []
+    core._archive_failed_turn_audio = lambda reason: archives.append(("failed", reason))
+    core._archive_recent_turn_audio = lambda reason: archives.append(("recent", reason))
+    core.on_transcription_error = notifications.append
+    core._start_session_task = lambda: restarts.append(True)
+
+    async def drain_capture():
+        drains.append(True)
+
+    core._stop_and_drain_audio_capture = drain_capture
+
+    class Socket:
+        client_state = WebSocketState.CONNECTED
+
+        def __init__(self):
+            self.sent = []
+
+        async def send_text(self, raw):
+            payload = json.loads(raw)
+            self.sent.append(payload)
+            await core._handle_message(payload, connection_generation=1)
+
+    class Provider:
+        def __init__(self):
+            self.handlers = {}
+            self.sent_audio = []
+            self.committed = asyncio.Event()
+
+        def register_handler(self, name, handler):
+            self.handlers[name] = handler
+
+        def set_on_disconnect(self, callback):
+            self.on_disconnect = callback
+
+        def _is_ws_open(self):
+            return True
+
+        async def send_audio(self, frame):
+            self.sent_audio.append(frame)
+            return True
+
+        async def commit_audio(self):
+            self.committed.set()
+
+        async def clear_audio_buffer(self):
+            pass
+
+        async def close(self):
+            pass
+
+    config = replace(
+        TranscriptionTurnSessionConfig.from_env(),
+        max_turn_audio_bytes=9_600,
+        provider_init_max_attempts=1,
+        provider_init_retry_delay_sec=0,
+        transcription_finalize_timeout_sec=5,
+    )
+    socket = Socket()
+    session = TranscriptionTurnSession(socket, config)
+    providers = [Provider() for _ in range(3)]
+    rebuild_started, release_rebuild = asyncio.Event(), asyncio.Event()
+    created = []
+
+    async def init_provider(**kwargs):
+        index = len(created)
+        if index == 1:
+            rebuild_started.set()
+            await release_rebuild.wait()
+        provider = providers[index]
+        created.append(provider)
+        session._client = provider
+        session._provider_generation += 1
+        session._provider_audio_bytes = 0
+        session._begin_provider_epoch_locked()
+        session._register_client_handlers(provider)
+        return True
+
+    session._init_or_reuse_client = init_provider
+    await session._handle_start_recording({"turn_id": 71, "input_sample_rate": 24000})
+    frames = [bytes([i]) * 4_800 for i in (41, 42, 43)]
+    for frame in frames:
+        await session._handle_audio_bytes(frame)
+    await asyncio.wait_for(providers[0].committed.wait(), 1)
+    unit = "".join(f"{index:03d} " for index in range(45))
+    loop = "Unique preface. " + unit * 31 + "Unique ending."
+
+    async def complete(index, text):
+        provider = providers[index]
+        item = f"guard-item-{index}"
+        await provider.handlers["input_audio_buffer.committed"]({"item_id": item})
+        await provider.handlers["conversation.item.input_audio_transcription.delta"](
+            {"item_id": item, "event_id": f"guard-delta-{index}", "delta": text}
+        )
+        await provider.handlers["conversation.item.input_audio_transcription.completed"](
+            {"item_id": item, "transcript": text}
+        )
+
+    await complete(0, loop)
+    await asyncio.wait_for(rebuild_started.wait(), 1)
+    stop_task = None
+
+    async def async_stop():
+        nonlocal stop_task
+        stop_task = asyncio.create_task(session._handle_stop_recording({"turn_id": 71}))
+        await asyncio.sleep(0)
+
+    core._async_stop = async_stop
+    if stop_during_retry:
+        await core._stop_recording()
+    retry_task = session._finalize_retry_task
+    release_rebuild.set()
+    await asyncio.wait_for(asyncio.shield(retry_task), 1)
+    await asyncio.wait_for(providers[1].committed.wait(), 1)
+    assert providers[0].sent_audio == providers[1].sent_audio == frames[:2]
+    assert core.pastes == [] and core.completions == []
+    recovered_prefix = "The recovered prefix. "
+    await complete(1, recovered_prefix if retry_succeeds else loop)
+
+    if retry_succeeds:
+        rollover = session._segment_rollover_task
+        assert rollover is not None
+        await asyncio.wait_for(asyncio.shield(rollover), 1)
+        if not stop_during_retry:
+            await core._stop_recording()
+        await asyncio.wait_for(providers[2].committed.wait(), 1)
+        tail = "The unique final tail."
+        await complete(2, tail)
+        await asyncio.wait_for(stop_task, 1)
+        expected = recovered_prefix + tail
+        assert core.pastes == [expected]
+        assert [entry[0] for entry in core.completions] == [expected]
+        assert notifications == [] and restarts == []
+        assert providers[2].sent_audio == frames[2:]
+        assert len(created) == 3
+    else:
+        await asyncio.wait_for(session._turn_done.wait(), 1)
+        if stop_task is not None:
+            await asyncio.wait_for(stop_task, 1)
+        assert core.pastes == [] and core.completions == []
+        assert 71 in core._failed_turn_ids
+        assert archives == [("failed", "repeated_transcript"), ("recent", "repeated_transcript")]
+        assert len(drains) == (0 if stop_during_retry else 1)
+        assert len(notifications) == 1 and "重复" in notifications[0]
+        assert restarts == [] and len(created) == 2
+    assert core.state == IMEState.IDLE
+    assert len([p for p in socket.sent if p.get("status") == "idle"]) == 1
+
+
+def test_terminal_transcription_error_is_displayed_on_main_ui_queue(monkeypatch):
+    app = BrainwaveIMEApp.__new__(BrainwaveIMEApp)
+    app._backend_events = queue.Queue()
+    app._current_backend = BACKEND_WHISPER
+    app.core = SimpleNamespace(state=IMEState.IDLE)
+    app._lifecycle_event_is_current = lambda _token: True
+    app._sync_backend_menu = lambda _state: None
+    app._sync_provider_menu = lambda: None
+    app._sync_model_menu = lambda: None
+    app._sync_status_menu = lambda _state: None
+    notifications = []
+    monkeypatch.setattr(ime_menubar.rumps, "notification", lambda *args: notifications.append(args))
+    app._on_transcription_error("转写重复，录音已保存。")
+    app._drain_backend_events()
+    assert notifications == [("EchoWave IME", "转写失败", "转写重复，录音已保存。")]
+
+
+@pytest.mark.parametrize("drain_raises", [False, True])
+@pytest.mark.parametrize("callback_raises", [False, True])
+@pytest.mark.asyncio
+async def test_terminal_error_remains_failed_when_capture_or_notification_raises(
+    drain_raises, callback_raises
+):
+    core = _transcript_delivery_core()
+    archives = []
+
+    async def drain_capture():
+        if drain_raises:
+            raise RuntimeError("synthetic drain failure")
+
+    def notify(message):
+        assert "重复" in message
+        if callback_raises:
+            raise RuntimeError("synthetic notification failure")
+
+    core._stop_and_drain_audio_capture = drain_capture
+    core.on_transcription_error = notify
+    core._archive_failed_turn_audio = lambda reason: archives.append(("failed", reason))
+    core._archive_recent_turn_audio = lambda reason: archives.append(("recent", reason))
+    core.transcript = "A known-bad provisional transcript."
+    await core._handle_message(
+        {"type": "error", "terminal": True, "reason": "repeated_transcript", "content": "转写重复。", "turn_id": 71}
+    )
+    await core._handle_message({"type": "status", "status": "idle", "turn_id": 71})
+    assert core.state == IMEState.IDLE
+    assert 71 in core._failed_turn_ids
+    assert core.pastes == [] and core.completions == []
+    assert archives == [("failed", "repeated_transcript"), ("recent", "repeated_transcript")]

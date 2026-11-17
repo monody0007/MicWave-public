@@ -10,14 +10,11 @@ import pytest
 import scipy.signal
 from starlette.websockets import WebSocketState
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-from openai_realtime_client import OpenAIRealtimeAudioTextClient
-from prompts import get_optimize_prompt, get_realtime_prompt
-from realtime_server import TurnSession, TurnSessionConfig
-from realtime_text_utils import (
+from micwave_core.openai_realtime_client import OpenAIRealtimeAudioTextClient
+from micwave_core.prompts import get_optimize_prompt, get_realtime_prompt
+from micwave_core.realtime_server import TurnSession, TurnSessionConfig
+from micwave_core.realtime_text_utils import (
     NO_SPEECH_PLACEHOLDER,
     emitted_novel_material_ratio,
     normalize_for_similarity,
@@ -1633,6 +1630,186 @@ async def test_no_marker_20_delta_path_replaced_by_input_transcript_on_finalize(
     assert session._emitted_text == fallback_text
 
 
+# ── task 0809: long no-marker turn lost words to a partial input transcript ──
+# Production T8 (2026-09-24 23:43): 465.42s of audio, model output 1760 chars
+# with no marker, flat 1.2s grace timed out, the 791-char delta partial replaced
+# the output, and the 1626-char completed transcript landed 6.1s after
+# response.done. Timing below is the production shape scaled by 1/100.
+T8_AUDIO_SEC = 465.42
+T8_TIME_SCALE = 0.01
+T8_GRACE_CONFIG = {
+    "input_transcript_grace_sec": 1.2 * T8_TIME_SCALE,
+    "input_transcript_grace_per_audio_sec": 0.03 * T8_TIME_SCALE,
+    "input_transcript_grace_max_sec": 30.0 * T8_TIME_SCALE,
+}
+
+
+def _non_repeating_text(n: int, offset: int) -> str:
+    # Distinct CJK characters: a phrase repeated 80 times is itself a repeat
+    # loop (W0322 is_runaway_repetition_transcript), which T8 was not.
+    return "".join(chr(0x4E00 + (offset + i * 7919) % 20000) for i in range(n))
+
+
+def _t8_texts():
+    model_output = _non_repeating_text(1760, 0)
+    completed = _non_repeating_text(1626, 11)
+    partial = completed[:791]
+    return model_output, partial, completed
+
+
+@pytest.mark.asyncio
+async def test_t8_long_no_marker_turn_adopts_completed_transcript_arriving_after_done():
+    session, client, ws = make_dispatcher_session(**T8_GRACE_CONFIG)
+    set_processed_audio_duration(session, T8_AUDIO_SEC)
+    model_output, partial, completed = _t8_texts()
+    # Scaled grace covers the scaled 6.1s late arrival; flat base would not.
+    expected_grace = (1.2 + 0.03 * T8_AUDIO_SEC) * T8_TIME_SCALE
+    assert session._scaled_input_transcript_grace_sec(
+        session._config.input_transcript_grace_sec
+    ) == pytest.approx(expected_grace, rel=1e-3)
+    assert expected_grace > 6.1 * T8_TIME_SCALE > session._config.input_transcript_grace_sec
+
+    dispatcher = asyncio.create_task(client.receive_messages())
+    try:
+        for i in range(0, len(model_output), 40):
+            await ws.push({"type": "response.text.delta", "delta": model_output[i:i + 40]})
+        for i in range(0, len(partial), 100):
+            await ws.push({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": partial[i:i + 100],
+            })
+        await ws.push({"type": "response.text.done"})
+        await ws.push({"type": "response.done"})
+
+        async def feed_completed_late():
+            await asyncio.sleep(6.1 * T8_TIME_SCALE)
+            await ws.push({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": completed,
+            })
+
+        feeder = asyncio.create_task(feed_completed_late())
+        await drain_finalize(session)
+        await feeder
+    finally:
+        await stop_dispatcher(dispatcher)
+
+    assert session._marker_seen is False
+    types = payload_types(session)
+    assert "replacement" in types and "status:idle" in types
+    assert types.index("replacement") < types.index("status:idle")
+    assert types.count("status:idle") == 1
+    replacements = [
+        p for p in session._websocket.sent_payloads
+        if p.get("type") == "text" and p.get("isNewResponse") is True
+    ]
+    assert [p["content"] for p in replacements] == [completed]
+    assert session._emitted_text == completed
+    assert session._input_transcript_wait_timeouts == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion", ["never", "failed"])
+async def test_t8_no_marker_without_completed_transcript_keeps_model_output_not_partial(
+    completion, caplog
+):
+    session = make_session(**T8_GRACE_CONFIG)
+    set_processed_audio_duration(session, T8_AUDIO_SEC)
+    model_output, partial, _ = _t8_texts()
+    session._marker_seen = False
+    session._emitted_text = model_output
+    await session._on_input_transcription_delta({"delta": partial})
+
+    if completion == "failed":
+        async def fail_later():
+            await asyncio.sleep(0.005)
+            await session._on_input_transcription_failed(
+                {"error": {"type": "server_error", "code": "failed", "message": "boom"}}
+            )
+
+        failer = asyncio.create_task(fail_later())
+
+    with caplog.at_level(logging.INFO, logger="micwave_core.realtime_server"):
+        await session._apply_input_transcription_fallback("response.done")
+    if completion == "failed":
+        await failer
+
+    assert session._input_transcript_completed is False
+    assert session._websocket.sent_payloads == []
+    assert session._emitted_text == model_output
+    assert session._emitted_text != partial
+    assert (
+        f"kept model output; input transcript incomplete (partial_len={len(partial)}"
+        in caplog.text
+    )
+    assert "Replacing emitted text" not in caplog.text
+    if completion == "never":
+        assert session._input_transcript_wait_timeouts == 1
+        assert "failing open to non-empty model output" in caplog.text
+
+
+def test_input_transcript_grace_scaling_keeps_short_audio_near_base():
+    # Production defaults (base 1.2 / suspicious 3.0, per_audio 0.03, max 30).
+    session = make_session(
+        input_transcript_grace_sec=1.2,
+        suspicious_input_transcript_grace_sec=3.0,
+    )
+    cfg = session._config
+    assert cfg.input_transcript_grace_per_audio_sec == 0.03
+    assert cfg.input_transcript_grace_max_sec == 30.0
+
+    set_processed_audio_duration(session, 5.0)
+    assert session._scaled_input_transcript_grace_sec(1.2) == pytest.approx(1.35)
+    set_processed_audio_duration(session, 0.0)
+    assert session._scaled_input_transcript_grace_sec(1.2) == pytest.approx(1.2)
+    set_processed_audio_duration(session, 25.0)
+    assert session._scaled_input_transcript_grace_sec(3.0) == pytest.approx(3.75)
+    set_processed_audio_duration(session, T8_AUDIO_SEC)
+    assert session._scaled_input_transcript_grace_sec(1.2) == pytest.approx(15.16, abs=0.01)
+    set_processed_audio_duration(session, 3000.0)
+    assert session._scaled_input_transcript_grace_sec(1.2) == pytest.approx(30.0)
+    # base <= 0 keeps meaning "no wait" even for long audio.
+    assert session._scaled_input_transcript_grace_sec(0.0) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_short_no_marker_turn_grace_wait_stays_near_base():
+    # 5s of audio at test-scale base 0.05 + 0.03*5*scale must not balloon.
+    session = make_session(
+        input_transcript_grace_sec=0.05,
+        input_transcript_grace_per_audio_sec=0.03 * T8_TIME_SCALE,
+    )
+    set_processed_audio_duration(session, 5.0)
+    session._marker_seen = False
+    session._emitted_text = "short model output without marker"
+    started = time.perf_counter()
+    await session._apply_input_transcription_fallback("response.done")
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.05 + 0.0015 + 0.1
+    assert session._input_transcript_wait_timeouts == 1
+    assert session._emitted_text == "short model output without marker"
+
+
+def test_input_transcript_grace_scaling_env_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_PER_AUDIO_SEC", raising=False)
+    monkeypatch.delenv("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_MAX_SEC", raising=False)
+    cfg = TurnSessionConfig.from_env()
+    assert cfg.input_transcript_grace_per_audio_sec == 0.03
+    assert cfg.input_transcript_grace_max_sec == 30.0
+
+    monkeypatch.setenv("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_PER_AUDIO_SEC", "0.05")
+    monkeypatch.setenv("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_MAX_SEC", "12")
+    cfg = TurnSessionConfig.from_env()
+    assert cfg.input_transcript_grace_per_audio_sec == 0.05
+    assert cfg.input_transcript_grace_max_sec == 12.0
+
+    monkeypatch.setenv("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_PER_AUDIO_SEC", "-1")
+    monkeypatch.setenv("BRAINWAVE_INPUT_TRANSCRIPT_GRACE_MAX_SEC", "bogus")
+    cfg = TurnSessionConfig.from_env()
+    assert cfg.input_transcript_grace_per_audio_sec == 0.0
+    assert cfg.input_transcript_grace_max_sec == 30.0
+
+
 @pytest.mark.asyncio
 async def test_marker_seen_answer_guard_replaces_dissimilar_completed_transcript():
     # Short audio (not suspicious) but marker-following output is an answer that
@@ -1890,7 +2067,7 @@ async def test_s1_mid_guard_concurrent_finalize_during_answer_guard_no_replaceme
     # Drive the error through the REAL serial dispatcher while the answer-guard
     # similarity diff is deterministically held open in its thread.
     import threading
-    import realtime_server as rs
+    from micwave_core import realtime_server as rs
 
     reached = threading.Event()   # set inside the diff -> to_thread window is open
     proceed = threading.Event()   # test releases the diff after the finalize lands
@@ -2290,3 +2467,59 @@ def test_parse_ratio_env_rejects_bogus_inf_and_out_of_range(monkeypatch):
     assert parse_ratio_env("MW_TEST_RATIO", 0.6) == 0.6  # above 1
     monkeypatch.setenv("MW_TEST_RATIO", "-0.1")
     assert parse_ratio_env("MW_TEST_RATIO", 0.6) == 0.6  # below 0
+
+
+# ── task 1082 round 2: commit/start_response failure on stop ────────────────
+
+
+def _idle_statuses(session):
+    return [
+        payload
+        for payload in session._websocket.sent_payloads
+        if payload.get("type") == "status" and payload.get("status") == "idle"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stop_commit_ack_timeout_finalizes_once_and_rotates_session():
+    from micwave_core.openai_realtime_client import CommitNotAcknowledgedError
+
+    session, client, audio_cache = make_recording_gate_session()
+
+    async def commit_times_out():
+        client.commit_calls += 1
+        raise CommitNotAcknowledgedError("no ack")
+
+    client.commit_audio = commit_times_out
+    await session._handle_audio_bytes(b"\x00\x00" * 20 + b"\x01\x00")
+
+    await session._handle_stop_recording({"turn_id": 111})
+
+    assert session._finalized is True
+    assert client.start_response_calls == 0
+    assert len(_idle_statuses(session)) == 1
+    assert [entry["outcome"] for entry in audio_cache.enqueued] == ["commit_failed"]
+    # The session whose commit failed is not reused for the next turn.
+    assert client.close_calls == 1
+    assert session._client is None
+
+
+@pytest.mark.asyncio
+async def test_stop_commit_rejected_after_provider_error_sends_single_idle():
+    session, client, audio_cache = make_recording_gate_session()
+
+    async def commit_rejected():
+        client.commit_calls += 1
+        # Provider error frame is dispatched before commit_audio() raises.
+        await session._on_error({"error": {"message": "buffer too small"}})
+        raise RuntimeError("OpenAI rejected input_audio_buffer.commit")
+
+    client.commit_audio = commit_rejected
+    await session._handle_audio_bytes(b"\x00\x00" * 20 + b"\x01\x00")
+
+    await session._handle_stop_recording({"turn_id": 111})
+
+    assert client.start_response_calls == 0
+    assert len(_idle_statuses(session)) == 1
+    assert [entry["outcome"] for entry in audio_cache.enqueued] == ["error"]
+    assert session._client is None

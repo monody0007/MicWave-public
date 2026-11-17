@@ -22,7 +22,16 @@ import numpy as np
 import scipy.signal
 import websockets
 import pyaudio
-from audio_spool import AudioSpoolError, TurnAudioSpool
+from micwave_core.audio_spool import AudioSpoolError, TurnAudioSpool
+from micwave_core.transcript_store import (
+    WINDOW_ALL,
+    WINDOWS,
+    TranscriptStoreReader,
+    append_record,
+    filter_records,
+    format_recent_title,
+    history_dir,
+)
 from backend_runtime import (
     BACKEND_ECHO,
     BACKEND_WHISPER,
@@ -34,14 +43,14 @@ from backend_runtime import (
     StartupDecision,
     build_default_descriptors,
 )
-from transcript_merge import merge_incremental_text
+from micwave_core.transcript_merge import merge_incremental_text
 
 # macOS 原生 API
 from Quartz import (
     CGEventTapCreate, CGEventTapEnable, CGEventMaskBit,
     kCGEventKeyDown,
     kCGHeadInsertEventTap, kCGSessionEventTap,
-    CGEventGetIntegerValueField, kCGKeyboardEventKeycode,
+    CGEventGetIntegerValueField, kCGKeyboardEventKeycode, kCGKeyboardEventAutorepeat,
     CGEventGetFlags, kCGEventFlagMaskCommand,
     CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags,
     CGEventSetType, kCGEventNull,
@@ -73,25 +82,17 @@ except ImportError:
     print("Warning: rumps not installed. Run: pip install rumps")
 
 try:
-    import objc
     from AppKit import (
+        NSApplication,
         NSPanel,
         NSButton,
-        NSColor,
+        NSSearchField,
+        NSSegmentedControl,
+        NSTextField,
         NSFont,
-        NSPointInRect,
         NSPasteboard,
         NSSound,
-        NSTextField,
-        NSTrackingActiveAlways,
-        NSTrackingArea,
-        NSTrackingAssumeInside,
-        NSTrackingInVisibleRect,
-        NSTrackingMouseEnteredAndExited,
         NSEventTrackingRunLoopMode,
-        NSView,
-        NSViewHeightSizable,
-        NSViewWidthSizable,
         NSWindowStyleMaskTitled,
         NSWindowStyleMaskClosable,
         NSWindowStyleMaskUtilityWindow,
@@ -102,24 +103,16 @@ try:
     HAS_APPKIT = True
 except Exception:
     HAS_APPKIT = False
-    objc = None
+    NSApplication = None
     NSPanel = None
     NSButton = None
-    NSColor = None
+    NSSearchField = None
+    NSSegmentedControl = None
+    NSTextField = None
     NSFont = None
-    NSPointInRect = None
     NSPasteboard = None
     NSSound = None
-    NSTextField = None
-    NSTrackingActiveAlways = None
-    NSTrackingArea = None
-    NSTrackingAssumeInside = None
-    NSTrackingInVisibleRect = None
-    NSTrackingMouseEnteredAndExited = None
     NSEventTrackingRunLoopMode = None
-    NSView = None
-    NSViewHeightSizable = None
-    NSViewWidthSizable = None
     NSWindowStyleMaskTitled = None
     NSWindowStyleMaskClosable = None
     NSWindowStyleMaskUtilityWindow = None
@@ -131,122 +124,55 @@ PROJECT_DIR = os.path.abspath(os.path.dirname(__file__))
 PASTEBOARD_TEXT_TYPE = "public.utf8-plain-text"
 KEYCODE_V = 9
 _DEFAULT_AUDIO_QUEUE_MAX_FRAMES = 1000
-_BACKEND_SWITCH_VIEW_WIDTH = 240.0
-_BACKEND_SWITCH_VIEW_HEIGHT = 24.0
+
+# The lane picker is one fixed-order block: every lane this shell can serve has
+# its own row, the row in use carries the check mark, and the rest are the only
+# clickable targets. Order is a property of the menu, not of whichever order a
+# supervisor happens to hand its descriptors over in.
+BACKEND_MENU_ORDER = (
+    BACKEND_ECHO,
+    BACKEND_WHISPER,
+)
 
 
-if HAS_APPKIT:
-    class BackendSwitchMenuView(NSView):
-        """Sticky custom content for the backend menu row.
+def backend_menu_rows(current, descriptors, *, idle, lifecycle_active):
+    """Rows for the lane picker: ``(key, title, enabled, checked)`` per lane.
 
-        NSMenu owns tracking while this view receives the click, so no standard
-        NSMenuItem action fires and the popup remains open during the async
-        backend transaction.
-        """
+    Pure: no rumps, no AppKit. The menu wiring and the tests both read the
+    structure from here, so row order, titles, greying and the check mark can
+    be asserted without standing up a GUI.
 
-        def configureWithOwner_(self, owner):
-            self._owner = owner
-            self._interaction_enabled = False
-            self._dismiss_on_exit_armed = False
-            self._dismissal_sent = False
-            self._tracking_area = None
+    A lane absent from *descriptors* has no row at all, which is how a machine
+    without the sibling fork keeps the two-lane menu it has always had.
+    """
+    selectable = bool(idle) and not bool(lifecycle_active)
+    rows = []
+    for key in BACKEND_MENU_ORDER:
+        descriptor = descriptors.get(key)
+        if descriptor is None:
+            continue
+        checked = key == current
+        # The lane in use is never a switch target, so it stays greyed out and
+        # is the only row carrying the check mark.
+        rows.append((key, descriptor.label, selectable and not checked, checked))
+    return rows
 
-            label = NSTextField.alloc().initWithFrame_(
-                (
-                    (12.0, 2.0),
-                    (
-                        _BACKEND_SWITCH_VIEW_WIDTH - 24.0,
-                        _BACKEND_SWITCH_VIEW_HEIGHT - 4.0,
-                    ),
-                )
-            )
-            label.setEditable_(False)
-            label.setSelectable_(False)
-            label.setBezeled_(False)
-            label.setBordered_(False)
-            label.setDrawsBackground_(False)
-            label.setFont_(NSFont.menuFontOfSize_(13.0))
-            label.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-            self.addSubview_(label)
-            self._label = label
-            self.updateTrackingAreas()
 
-        def setBackendLabel_enabled_(self, label, enabled):
-            label = str(label)
-            enabled = bool(enabled)
-            self._label.setStringValue_(label)
-            self._label.setTextColor_(
-                NSColor.controlTextColor()
-                if enabled
-                else NSColor.disabledControlTextColor()
-            )
-            self.setAccessibilityLabel_(label)
-            self.setAccessibilityEnabled_(enabled)
-            self._interaction_enabled = enabled
-            self.setNeedsDisplay_(True)
-
-        def setDismissOnExitArmed_(self, armed):
-            self._dismiss_on_exit_armed = bool(armed)
-            self._dismissal_sent = False
-
-        def hitTest_(self, point):
-            # Keep the child text field from consuming the click. The whole row
-            # is one control and mouseUp_ below is its only action path.
-            return self if NSPointInRect(point, self.bounds()) else None
-
-        def mouseDown_(self, _event):
-            # Consuming mouse-down prevents the event from becoming a standard
-            # menu command, which would end NSMenu tracking immediately.
-            pass
-
-        def mouseUp_(self, _event):
-            if not self._interaction_enabled:
-                return
-            owner = getattr(self, "_owner", None)
-            callback = getattr(owner, "_backend_switch_selected", None)
-            if callback is not None:
-                callback(None)
-
-        def updateTrackingAreas(self):
-            tracking_area = getattr(self, "_tracking_area", None)
-            if tracking_area is not None:
-                self.removeTrackingArea_(tracking_area)
-            objc.super(BackendSwitchMenuView, self).updateTrackingAreas()
-            options = (
-                NSTrackingMouseEnteredAndExited
-                | NSTrackingActiveAlways
-                | NSTrackingInVisibleRect
-                | NSTrackingAssumeInside
-            )
-            tracking_area = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
-                self.bounds(),
-                options,
-                self,
-                None,
-            )
-            self.addTrackingArea_(tracking_area)
-            self._tracking_area = tracking_area
-
-        def mouseExited_(self, _event):
-            if not self._dismiss_on_exit_armed or self._dismissal_sent:
-                return
-            self._dismissal_sent = True
-            self._dismiss_on_exit_armed = False
-            owner = getattr(self, "_owner", None)
-            cancel_tracking = getattr(owner, "_cancel_backend_menu_tracking", None)
-            if cancel_tracking is not None:
-                cancel_tracking()
-
-        def viewDidMoveToWindow(self):
-            objc.super(BackendSwitchMenuView, self).viewDidMoveToWindow()
-            if self.window() is None:
-                self.setDismissOnExitArmed_(False)
-else:
-    BackendSwitchMenuView = None
+def backend_header_title(current_label, switching_to_label=None):
+    """Title for the read-only first row above the lane rows."""
+    if switching_to_label:
+        return f"Switching to {switching_to_label}..."
+    return f"Using: {current_label}"
 
 
 def _register_timer_for_menu_tracking(timer, *, run_loop=None):
-    """Register rumps' existing native timer in menu-tracking run-loop mode."""
+    """Register rumps' existing native timer in menu-tracking run-loop mode.
+
+    Independent of any custom menu view: while an NSMenu is tracking, the
+    default run-loop mode is suspended, so ``_poll_state`` would stop firing
+    and the Status row plus the lane rows would freeze at whatever they showed
+    when the menu opened.
+    """
     if not HAS_APPKIT:
         return None
     native_timer = getattr(timer, "_nstimer", None)
@@ -356,6 +282,7 @@ class BrainwaveIMECore:
         on_transcript=None,
         on_transcript_complete=None,
         on_processing_delay=None,
+        on_transcription_error=None,
     ):
         self.config = config
         self.state = IMEState.DISCONNECTED
@@ -408,6 +335,7 @@ class BrainwaveIMECore:
         self.on_transcript = on_transcript
         self.on_transcript_complete = on_transcript_complete
         self.on_processing_delay = on_processing_delay
+        self.on_transcription_error = on_transcription_error
         self._receive_task = None
         # Two-state session lifecycle (task 0436 S2):
         #   _start_requested  — start_recording message has been sent
@@ -1280,6 +1208,10 @@ class BrainwaveIMECore:
                 return
             if is_new:
                 self.transcript = content
+            elif getattr(self, "_active_turn_backend", None) == BACKEND_WHISPER:
+                # Whisper's wire contract carries new text, not overlapping
+                # snapshots. Content-based dedup would erase spoken repetition.
+                self.transcript += content
             else:
                 self.transcript = merge_incremental_text(self.transcript, content)
             if self.on_transcript:
@@ -1287,6 +1219,33 @@ class BrainwaveIMECore:
 
         elif msg_type == "error":
             print(f"[IME] Error: {data.get('content')}")
+            if data.get("terminal") is True and self.state in (
+                IMEState.RECORDING, IMEState.PROCESSING
+            ):
+                if self._active_turn_id is not None:
+                    self._failed_turn_ids.add(self._active_turn_id)
+                if self.state == IMEState.RECORDING:
+                    try:
+                        await self._stop_and_drain_audio_capture()
+                    except Exception as exc:
+                        print(f"[IME] Capture drain after terminal transcription error raised: {type(exc).__name__}")
+                reason = data.get("reason") or "transcription_error"
+                archive_path = self._archive_failed_turn_audio(reason)
+                self._archive_recent_turn_audio(reason)
+                self._start_requested = False
+                self._server_connected = False
+                self._play_sound(getattr(getattr(self, "config", None), "error_sound", Config.error_sound))
+                self._set_state(IMEState.IDLE)
+                callback = getattr(self, "on_transcription_error", None)
+                if callback:
+                    try:
+                        message = data.get("content") or "转写失败，本次未自动粘贴。"
+                        if archive_path:
+                            message += "录音已保存。"
+                        callback(message)
+                    except Exception as exc:
+                        print(f"[IME] Transcription error callback raised: {type(exc).__name__}")
+                return
             if self.state == IMEState.RECORDING:
                 # Keep recording locally; retry session in background. Only alert
                 # (Basso) if we had a working connected session; a warmup/
@@ -1838,8 +1797,9 @@ class BrainwaveIMECore:
 
         self._invalidate_recording_token()
         self._stop_pressed_ts = time.perf_counter()
-        # Ensure each processing turn starts from a clean transcript buffer.
-        self.transcript = ""
+        # Recording and processing belong to the same turn. Rollover text may
+        # already be complete, with no replacement needed before terminal idle.
+        # The next start resets this buffer.
         self._set_state(IMEState.PROCESSING)
 
         await self._async_stop()
@@ -2069,6 +2029,7 @@ if HAS_RUMPS:
             self._active_lifecycle_operation = None
             self._active_lifecycle_kind = None
             self._switch_in_progress = False
+            self._pending_switch_target = None
 
             self.config = Config()
             initial_descriptor = self._backend_supervisor.descriptor(self._current_backend)
@@ -2083,6 +2044,7 @@ if HAS_RUMPS:
                 on_transcript=self._on_transcript,
                 on_transcript_complete=self._on_transcript_complete,
                 on_processing_delay=self._on_processing_delay,
+                on_transcription_error=self._on_transcription_error,
             )
 
             self.provider_labels = {key: label for key, label in self.PROVIDER_OPTIONS}
@@ -2090,11 +2052,10 @@ if HAS_RUMPS:
             self._selected_provider = self.config.provider
             self._selected_model = self.config.model
             self.status_item = rumps.MenuItem("Status: Disconnected", callback=self._noop)
-            self.backend_switch_item = rumps.MenuItem(
-                self._backend_label(),
+            self.backend_header_item = rumps.MenuItem(
+                backend_header_title(self._backend_label()),
                 callback=None,
             )
-            self._attach_backend_switch_view()
             self.reconnect_item = rumps.MenuItem("Reconnect", callback=self.reconnect)
             self.restart_item = rumps.MenuItem("Restart Service", callback=self._restart_service)
 
@@ -2114,22 +2075,43 @@ if HAS_RUMPS:
                 self.model_menu.add(item)
                 self.model_items[key] = item
 
+            # One row per owned lane in BACKEND_MENU_ORDER (Echo and Whisper).
+            self.backend_row_items = {}
+            for row_key in BACKEND_MENU_ORDER:
+                if row_key not in self._backend_supervisor.descriptors:
+                    continue
+                row_item = rumps.MenuItem(
+                    self._backend_supervisor.descriptor(row_key).label,
+                    callback=self._backend_row_selected,
+                )
+                row_item._backend_key = row_key
+                self.backend_row_items[row_key] = row_item
+
             self.hotkeys_item = rumps.MenuItem("Hotkey: Cmd+` (Optimized)", callback=None)
 
-            self._recent_limit = 5
+            self._recent_limit = 8
             self._pending_transcripts = queue.Queue()
             self._recent_transcripts = []
-            self._history_dir = self._resolve_history_dir()
+            self._recent_match_count = 0
+            self._recent_query = ""
+            self._recent_window = WINDOW_ALL
+            self._history_dir = history_dir()
             self._history_file = os.path.join(self._history_dir, "transcripts.jsonl")
+            self._history_reader = TranscriptStoreReader(self._history_file)
             self._recent_item = rumps.MenuItem("Recent", callback=self._open_recent_panel)
             self._history_item = rumps.MenuItem("History", callback=self._open_history_folder)
             self._recent_panel = None
             self._recent_panel_buttons = []
+            self._recent_search_field = None
+            self._recent_window_control = None
+            self._recent_count_label = None
 
             self._load_recent_history()
 
             self.menu = [
-                self.backend_switch_item,
+                self.backend_header_item,
+                *self.backend_row_items.values(),
+                None,
                 self.status_item,
                 None,
                 self.provider_menu,
@@ -2213,12 +2195,17 @@ if HAS_RUMPS:
 
                         # 监听 Cmd + ` (keycode 50) - 触发优化模式
                         if keycode == self.config.hotkey_keycode and cmd_pressed:
+                            is_repeat = bool(
+                                CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat)
+                            )
                             # 标记为 Null 事件，避免系统默认切换窗口导致光标跳走
                             try:
                                 CGEventSetType(event, kCGEventNull)
                             except Exception as exc:
                                 print(f"[EventTap] Failed to nullify event: {exc}")
-                            if self.loop:
+                            # Holding the shortcut is one press, even if a turn
+                            # finishes while macOS keeps sending keydown repeats.
+                            if self.loop and not is_repeat:
                                 self.loop.call_soon_threadsafe(
                                     lambda: asyncio.ensure_future(self.core._handle_hotkey())
                                 )
@@ -2314,76 +2301,6 @@ if HAS_RUMPS:
             key = backend or self._current_backend
             return self._backend_supervisor.descriptor(key).label
 
-        def _attach_backend_switch_view(self) -> None:
-            self.backend_switch_view = None
-            if not HAS_APPKIT or BackendSwitchMenuView is None:
-                print(
-                    "[UI] AppKit custom menu views are unavailable; "
-                    "backend switching is disabled"
-                )
-                return
-            native_item = getattr(self.backend_switch_item, "_menuitem", None)
-            required_methods = ("setAction_", "action", "setView_", "view")
-            missing = [
-                name
-                for name in required_methods
-                if native_item is None or not hasattr(native_item, name)
-            ]
-            if missing:
-                raise RuntimeError(
-                    "rumps MenuItem bridge changed; sticky backend switch "
-                    f"cannot attach ({', '.join(missing)})"
-                )
-
-            native_item.setAction_(None)
-            view = BackendSwitchMenuView.alloc().initWithFrame_(
-                (
-                    (0.0, 0.0),
-                    (_BACKEND_SWITCH_VIEW_WIDTH, _BACKEND_SWITCH_VIEW_HEIGHT),
-                )
-            )
-            if view is None:
-                raise RuntimeError("AppKit failed to allocate backend switch view")
-            view.configureWithOwner_(self)
-            native_item.setView_(view)
-            if native_item.action() is not None or native_item.view() is not view:
-                raise RuntimeError(
-                    "rumps MenuItem bridge rejected sticky backend switch view"
-                )
-            # Retain the PyObjC proxy, its label, and tracking area for the full
-            # app lifetime. NSMenuItem also retains the native view.
-            self.backend_switch_view = view
-
-        def _set_backend_switch_dismiss_armed(self, armed: bool) -> None:
-            view = getattr(self, "backend_switch_view", None)
-            if view is None:
-                return
-            setter = getattr(view, "setDismissOnExitArmed_", None)
-            if setter is None:
-                raise RuntimeError(
-                    "backend switch view bridge changed: "
-                    "setDismissOnExitArmed_ is unavailable"
-                )
-            setter(bool(armed))
-
-        def _cancel_backend_menu_tracking(self) -> None:
-            native_item = getattr(self.backend_switch_item, "_menuitem", None)
-            menu_getter = getattr(native_item, "menu", None)
-            if menu_getter is None:
-                raise RuntimeError(
-                    "rumps MenuItem bridge changed: native menu is unavailable"
-                )
-            menu = menu_getter()
-            if menu is None:
-                return
-            cancel_tracking = getattr(menu, "cancelTrackingWithoutAnimation", None)
-            if cancel_tracking is None:
-                raise RuntimeError(
-                    "AppKit menu bridge changed: "
-                    "cancelTrackingWithoutAnimation is unavailable"
-                )
-            cancel_tracking()
-
         def _model_label(self) -> str:
             return self.model_labels.get(self._selected_model, self._selected_model)
 
@@ -2403,6 +2320,10 @@ if HAS_RUMPS:
                 self._active_lifecycle_operation = token
                 self._active_lifecycle_kind = kind
                 self._switch_in_progress = True
+                # Every operation starts with no announced destination; only a
+                # lane click fills this in, so a reconnect or restart can never
+                # inherit a stale "Switching to ..." header.
+                self._pending_switch_target = None
                 return token
 
         def _adopt_lifecycle_operation(
@@ -2424,6 +2345,7 @@ if HAS_RUMPS:
                 self._active_lifecycle_operation = None
                 self._active_lifecycle_kind = None
                 self._switch_in_progress = False
+                self._pending_switch_target = None
             self._backend_events.put(
                 ("operation_finished", self._current_backend, None, token)
             )
@@ -2451,23 +2373,34 @@ if HAS_RUMPS:
                 )
 
         def _sync_backend_menu(self, state: IMEState):
-            label = self._backend_label()
-            self.backend_switch_item.title = label
-            self.backend_switch_item.state = 0
-            enabled = (
-                state in (IMEState.IDLE, IMEState.DISCONNECTED)
-                and not self._lifecycle_operation_active()
+            lifecycle_active = self._lifecycle_operation_active()
+            pending_target = getattr(self, "_pending_switch_target", None)
+            switching_to = (
+                self._backend_label(pending_target)
+                if lifecycle_active and pending_target is not None
+                else None
             )
-            self.backend_switch_item._menuitem.setEnabled_(enabled)
-            view = getattr(self, "backend_switch_view", None)
-            if view is not None:
-                setter = getattr(view, "setBackendLabel_enabled_", None)
-                if setter is None:
-                    raise RuntimeError(
-                        "backend switch view bridge changed: "
-                        "setBackendLabel_enabled_ is unavailable"
-                    )
-                setter(label, enabled)
+            self.backend_header_item.title = backend_header_title(
+                self._backend_label(),
+                switching_to,
+            )
+            # The header reports, it never acts.
+            self.backend_header_item._menuitem.setEnabled_(False)
+
+            rows = backend_menu_rows(
+                self._current_backend,
+                self._backend_supervisor.descriptors,
+                idle=state in (IMEState.IDLE, IMEState.DISCONNECTED),
+                lifecycle_active=lifecycle_active,
+            )
+            row_items = getattr(self, "backend_row_items", {})
+            for key, title, enabled, checked in rows:
+                item = row_items.get(key)
+                if item is None:
+                    continue
+                item.title = title
+                item.state = 1 if checked else 0
+                item._menuitem.setEnabled_(enabled)
 
         def _sync_provider_menu(self):
             for key, item in self.provider_items.items():
@@ -2525,7 +2458,19 @@ if HAS_RUMPS:
             self._sync_model_menu()
             self._sync_status_menu(self.core.state)
 
-        def _backend_switch_selected(self, _):
+        def _backend_row_selected(self, sender):
+            """Menu callback for every lane row: point at one, go to it.
+
+            One callback for all lanes means the idle gate and the lifecycle
+            token gate are written once, so no lane can drift into its own
+            admission rules.
+            """
+            target = getattr(sender, "_backend_key", None)
+            if target not in self._backend_supervisor.descriptors:
+                print(f"[UI] Unknown backend target: {target!r}")
+                return
+            if target == self._current_backend:
+                return
             if (
                 self.core.state not in (IMEState.IDLE, IMEState.DISCONNECTED)
                 or not self.loop
@@ -2534,12 +2479,7 @@ if HAS_RUMPS:
             operation_token = self._begin_lifecycle_operation("switch")
             if operation_token is None:
                 return
-            self._set_backend_switch_dismiss_armed(False)
-            target = (
-                BACKEND_WHISPER
-                if self._current_backend == BACKEND_ECHO
-                else BACKEND_ECHO
-            )
+            self._pending_switch_target = target
             self._sync_backend_menu(self.core.state)
             self._sync_status_menu(self.core.state)
             self.loop.call_soon_threadsafe(
@@ -2596,7 +2536,6 @@ if HAS_RUMPS:
             operation_token = self._begin_lifecycle_operation("reconnect")
             if operation_token is None:
                 return
-            self._set_backend_switch_dismiss_armed(False)
             self._sync_backend_menu(self.core.state)
             self._sync_status_menu(self.core.state)
             self.loop.call_soon_threadsafe(
@@ -2649,7 +2588,6 @@ if HAS_RUMPS:
             operation_token = self._begin_lifecycle_operation("restart")
             if operation_token is None:
                 return
-            self._set_backend_switch_dismiss_armed(False)
             self._sync_backend_menu(self.core.state)
             self._sync_status_menu(self.core.state)
             self.loop.call_soon_threadsafe(
@@ -2733,6 +2671,9 @@ if HAS_RUMPS:
         def _on_transcript(self, text: str):
             pass
 
+        def _on_transcription_error(self, message: str):
+            self._backend_events.put(("transcription_error", self._current_backend, message))
+
         def _on_processing_delay(self, turn_id, elapsed: float):
             self._backend_events.put(
                 (
@@ -2771,8 +2712,6 @@ if HAS_RUMPS:
                     # dropping the payload can never strand the old label.
                     self._sync_backend_menu(self.core.state)
                     continue
-                arm_dismiss_after_render = False
-                reset_dismiss_after_render = False
                 if event == "switched":
                     core_backend = getattr(
                         getattr(self.core, "config", None),
@@ -2793,7 +2732,6 @@ if HAS_RUMPS:
                     self._selected_provider = self.core.config.provider
                     self._selected_model = self.core.config.model
                     print(f"[Backend] Active backend switched to {backend}")
-                    arm_dismiss_after_render = True
                     if detail:
                         print(f"[Backend] Cleanup warning: {detail}")
                         rumps.notification(
@@ -2803,7 +2741,6 @@ if HAS_RUMPS:
                         )
                 elif event == "error":
                     print(f"[Backend] Operation failed: {detail}")
-                    reset_dismiss_after_render = True
                     rumps.notification(
                         "EchoWave IME",
                         "Backend operation failed",
@@ -2815,16 +2752,12 @@ if HAS_RUMPS:
                         "Still processing",
                         detail or "Waiting for terminal transcription output.",
                     )
+                elif event == "transcription_error":
+                    rumps.notification("EchoWave IME", "转写失败", detail)
                 self._sync_backend_menu(self.core.state)
                 self._sync_provider_menu()
                 self._sync_model_menu()
                 self._sync_status_menu(self.core.state)
-                if reset_dismiss_after_render:
-                    self._set_backend_switch_dismiss_armed(False)
-                elif arm_dismiss_after_render:
-                    # Arm only after the committed target has been written to
-                    # both the native item title and the visible custom label.
-                    self._set_backend_switch_dismiss_armed(True)
 
         def _on_transcript_complete(
             self,
@@ -2846,51 +2779,25 @@ if HAS_RUMPS:
             }
             self._pending_transcripts.put(entry)
 
-        def _resolve_history_dir(self) -> str:
-            custom_dir = os.getenv("BRAINWAVE_HISTORY_DIR")
-            if custom_dir:
-                return os.path.expanduser(custom_dir)
-            return os.path.join(
-                os.path.expanduser("~"),
-                "Library",
-                "Application Support",
-                "Brainwave IME"
-            )
-
         def _load_recent_history(self):
-            self._recent_transcripts = []
+            """Reread the shared store (phone turns are appended by another
+            process) and recompute the rows for the current search/window."""
             try:
-                os.makedirs(self._history_dir, exist_ok=True)
-                if not os.path.exists(self._history_file):
-                    return
-                with open(self._history_file, "r", encoding="utf-8") as handle:
-                    for line in handle:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        text = record.get("text", "")
-                        if not text:
-                            continue
-                        self._recent_transcripts.append(record)
-                if len(self._recent_transcripts) > self._recent_limit:
-                    self._recent_transcripts = self._recent_transcripts[-self._recent_limit:]
-                self._recent_transcripts.reverse()
+                records = self._history_reader.refresh()
             except Exception as exc:
                 print(f"[History] Failed to load history: {exc}")
+                return
+            matches = filter_records(records, self._recent_query, self._recent_window)
+            self._recent_match_count = len(matches)
+            self._recent_transcripts = matches[:self._recent_limit]
 
         def _append_history(self, entry: dict):
             try:
-                os.makedirs(self._history_dir, exist_ok=True)
-                with open(self._history_file, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                append_record(self._history_file, entry)
             except Exception as exc:
                 print(f"[History] Failed to write history: {exc}")
 
-        def _drain_pending_transcripts(self):
+        def _drain_pending_transcripts(self, refresh: bool = True):
             updated = False
             while True:
                 try:
@@ -2898,34 +2805,10 @@ if HAS_RUMPS:
                 except queue.Empty:
                     break
                 self._append_history(entry)
-                self._recent_transcripts.insert(0, entry)
-                if len(self._recent_transcripts) > self._recent_limit:
-                    self._recent_transcripts = self._recent_transcripts[:self._recent_limit]
                 updated = True
-            if updated:
+            if updated and refresh:
+                self._load_recent_history()
                 self._update_recent_panel()
-
-        def _format_recent_title(self, entry: dict, index: int) -> str:
-            raw_text = entry.get("text", "").strip()
-            preview = " ".join(raw_text.splitlines()).strip()
-            if len(preview) > 80:
-                preview = preview[:77] + "..."
-            timestamp = entry.get("ts", "")
-            time_label = ""
-            if timestamp:
-                parts = timestamp.split(" ")
-                if len(parts) > 1:
-                    time_label = parts[1][:5]
-                else:
-                    time_label = timestamp[:5]
-            prefix = f"{time_label} | " if time_label else ""
-            backend = entry.get("backend")
-            backend_prefix = f"[{backend}] " if backend else ""
-            return (
-                f"{prefix}{backend_prefix}{preview}"
-                if preview
-                else f"{prefix}{backend_prefix}(empty)"
-            )
 
         def _update_recent_panel(self):
             if not self._recent_panel_buttons:
@@ -2933,11 +2816,29 @@ if HAS_RUMPS:
             for idx, button in enumerate(self._recent_panel_buttons):
                 if idx < len(self._recent_transcripts):
                     entry = self._recent_transcripts[idx]
-                    button.setTitle_(self._format_recent_title(entry, idx))
+                    button.setTitle_(format_recent_title(entry))
                     button.setEnabled_(True)
                 else:
                     button.setTitle_("(empty)")
                     button.setEnabled_(False)
+            if self._recent_count_label is not None:
+                total = self._recent_match_count
+                shown = len(self._recent_transcripts)
+                noun = "match" if total == 1 else "matches"
+                label = f"{total} {noun}" if shown == total else f"showing {shown} of {total} {noun}"
+                self._recent_count_label.setStringValue_(label)
+
+        def recentSearchChanged_(self, sender):
+            self._recent_query = str(sender.stringValue() or "")
+            self._load_recent_history()
+            self._update_recent_panel()
+
+        def recentWindowChanged_(self, sender):
+            index = int(sender.selectedSegment())
+            if 0 <= index < len(WINDOWS):
+                self._recent_window = WINDOWS[index]
+            self._load_recent_history()
+            self._update_recent_panel()
 
         def _open_history_folder(self, _):
             try:
@@ -2947,7 +2848,8 @@ if HAS_RUMPS:
                 print(f"[History] Failed to open history folder: {exc}")
 
         def _open_recent_panel(self, _):
-            self._drain_pending_transcripts()
+            self._drain_pending_transcripts(refresh=False)
+            self._load_recent_history()
             if not HAS_APPKIT:
                 rumps.alert(
                     "Recent",
@@ -2959,15 +2861,19 @@ if HAS_RUMPS:
                 self._build_recent_panel()
             self._update_recent_panel()
             try:
+                # Menubar app: activate so the search field receives typing.
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
                 self._recent_panel.makeKeyAndOrderFront_(None)
+                self._recent_panel.makeFirstResponder_(self._recent_search_field)
             except Exception as exc:
                 print(f"[History] Failed to show recent panel: {exc}")
 
         def _build_recent_panel(self):
-            width = 560
-            row_height = 54
+            width = 620
+            row_height = 48
             padding = 12
-            height = padding * 2 + row_height * self._recent_limit
+            header_height = 30
+            height = padding * 3 + header_height + row_height * self._recent_limit
             style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
             panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
                 ((0, 0), (width, height)),
@@ -2985,9 +2891,50 @@ if HAS_RUMPS:
                 pass
 
             content = panel.contentView()
+            header_y = height - padding - header_height
+            search_width = 260
+            search = NSSearchField.alloc().initWithFrame_(
+                ((padding, header_y + 3), (search_width, 24))
+            )
+            search.setPlaceholderString_("Search text or time (2026-11-10, 09:3)")
+            search.setStringValue_(self._recent_query)
+            search.setTarget_(self)
+            search.setAction_("recentSearchChanged:")
+            content.addSubview_(search)
+            self._recent_search_field = search
+
+            window_labels = {"today": "Today", "7d": "7 days", "all": "All"}
+            control_x = padding + search_width + 10
+            control_width = 200
+            control = NSSegmentedControl.alloc().initWithFrame_(
+                ((control_x, header_y + 2), (control_width, 26))
+            )
+            control.setSegmentCount_(len(WINDOWS))
+            for idx, window in enumerate(WINDOWS):
+                control.setLabel_forSegment_(window_labels[window], idx)
+            control.setSelectedSegment_(WINDOWS.index(self._recent_window))
+            control.setTarget_(self)
+            control.setAction_("recentWindowChanged:")
+            content.addSubview_(control)
+            self._recent_window_control = control
+
+            label_x = control_x + control_width + 10
+            label = NSTextField.alloc().initWithFrame_(
+                ((label_x, header_y + 6), (width - padding - label_x, 18))
+            )
+            label.setBezeled_(False)
+            label.setDrawsBackground_(False)
+            label.setEditable_(False)
+            label.setSelectable_(False)
+            label.setFont_(NSFont.systemFontOfSize_(11))
+            label.setStringValue_("")
+            content.addSubview_(label)
+            self._recent_count_label = label
+
             self._recent_panel_buttons = []
+            rows_top = header_y - padding
             for idx in range(self._recent_limit):
-                y = height - padding - (idx + 1) * row_height
+                y = rows_top - (idx + 1) * row_height
                 button = NSButton.alloc().initWithFrame_(
                     ((padding, y), (width - padding * 2, row_height - 6))
                 )
@@ -3014,6 +2961,8 @@ if HAS_RUMPS:
                 self._copy_to_clipboard(text)
             if self._recent_panel:
                 self._recent_panel.orderOut_(None)
+                # Hand focus back to the app the user was typing in.
+                NSApplication.sharedApplication().hide_(None)
 
         def _copy_to_clipboard(self, text: str):
             try:

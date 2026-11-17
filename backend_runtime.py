@@ -29,6 +29,14 @@ from typing import Awaitable, Callable, Mapping, Optional
 BACKEND_ECHO = "echo"
 BACKEND_WHISPER = "whisper"
 VALID_BACKENDS = frozenset({BACKEND_ECHO, BACKEND_WHISPER})
+# The two lanes this shell owns itself. A descriptor set without them is a
+# broken install, not an optional configuration.
+REQUIRED_BACKENDS = frozenset({BACKEND_ECHO, BACKEND_WHISPER})
+# Retired legacy sibling-checkout lanes (EchoWave-Meta, archived in W0347).
+# Accepted on read only so a machine upgrading with a legacy selection file
+# downgrades cleanly to FALLBACK_BACKEND rather than treating the file as corrupt.
+RETIRED_BACKENDS = frozenset({"meta", "meta_echo"})
+FALLBACK_BACKEND = BACKEND_WHISPER
 SELECTION_SCHEMA_VERSION = 1
 WIRE_CONTRACT_NAME = "echowave-pcm-websocket"
 WIRE_CONTRACT_VERSION = 1
@@ -145,7 +153,7 @@ class BackendSelectionStore:
                 f"unsupported backend selection version at {self.path}: {payload.get('version')!r}"
             )
         selected = payload.get("selected_backend")
-        if selected not in VALID_BACKENDS:
+        if selected not in VALID_BACKENDS and selected not in RETIRED_BACKENDS:
             raise SelectionStoreError(
                 f"unknown selected_backend at {self.path}: {selected!r}"
             )
@@ -300,7 +308,7 @@ def build_default_descriptors(
             label="WhisperWave",
             host="127.0.0.1",
             port=int(whisper_port),
-            command=(str(whisper_python_path), "-m", "whisper_backend"),
+            command=(str(whisper_python_path), "-m", "micwave_core.whisper_server"),
             cwd=str(project),
             pid_file=str(support / "whisper.pid"),
             log_file=str(logs / "whisper-backend.log"),
@@ -384,8 +392,20 @@ class BackendSupervisor:
         progress_interval: float = DEFAULT_START_PROGRESS_INTERVAL_SEC,
     ):
         self.descriptors = dict(descriptors)
-        if set(self.descriptors) != VALID_BACKENDS:
-            raise ValueError(f"descriptors must define exactly {sorted(VALID_BACKENDS)}")
+        # The two owned lanes are mandatory; the optional Meta lanes are
+        # registered only when the sibling fork is on disk, so membership is
+        # "required present, everything else known" rather than set equality.
+        missing = REQUIRED_BACKENDS - set(self.descriptors)
+        if missing:
+            raise ValueError(
+                f"descriptors must define {sorted(REQUIRED_BACKENDS)}; missing {sorted(missing)}"
+            )
+        unknown = set(self.descriptors) - VALID_BACKENDS
+        if unknown:
+            raise ValueError(
+                f"descriptors contain unknown backends {sorted(unknown)}; "
+                f"known backends are {sorted(VALID_BACKENDS)}"
+            )
         self._popen_factory = popen_factory
         self._probe_func = probe_func
         self._log = log
@@ -911,9 +931,16 @@ class BackendSupervisor:
 class BackendCoordinator:
     """Cold-start selection and idle-only start→probe→repoint→persist→stop."""
 
-    def __init__(self, supervisor: BackendSupervisor, selection_store: BackendSelectionStore):
+    def __init__(
+        self,
+        supervisor: BackendSupervisor,
+        selection_store: BackendSelectionStore,
+        *,
+        log: Callable[[str], None] = print,
+    ):
         self.supervisor = supervisor
         self.selection_store = selection_store
+        self._log = log
 
     def start_initial(self, *, timeout: Optional[float] = None) -> StartupDecision:
         # ``None`` is passed through so BackendSupervisor.start() remains the
@@ -926,6 +953,30 @@ class BackendCoordinator:
                 requested_backend="invalid",
                 effective_backend=BACKEND_ECHO,
                 diagnostic=str(exc),
+            )
+        # A persisted lane that is retired or not registered downgrades to
+        # FALLBACK_BACKEND rather than raising out of supervisor.descriptor().
+        if requested not in self.supervisor.descriptors:
+            unregistered = requested
+            requested = FALLBACK_BACKEND
+            diagnostic = (
+                f"persisted backend {unregistered!r} is retired or unregistered; "
+                f"falling back to {FALLBACK_BACKEND}"
+            )
+            self._log(f"[Backend] {diagnostic}")
+            try:
+                self.supervisor.start(requested, timeout=timeout)
+            except BackendRuntimeError as exc:
+                self.supervisor.start(BACKEND_ECHO, timeout=timeout)
+                return StartupDecision(
+                    requested_backend=unregistered,
+                    effective_backend=BACKEND_ECHO,
+                    diagnostic=f"{diagnostic}; {FALLBACK_BACKEND} also unavailable: {exc}",
+                )
+            return StartupDecision(
+                requested_backend=unregistered,
+                effective_backend=requested,
+                diagnostic=diagnostic,
             )
         try:
             self.supervisor.start(requested, timeout=timeout)

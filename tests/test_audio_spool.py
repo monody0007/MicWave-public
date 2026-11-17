@@ -2,7 +2,7 @@ import wave
 
 import pytest
 
-from audio_spool import AudioSpoolError, TurnAudioSpool
+from micwave_core.audio_spool import AudioSpoolError, TurnAudioSpool
 
 
 def _stream_duration(spool, *, seconds, head, tail, chunk_bytes=64 * 1024):

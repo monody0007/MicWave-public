@@ -4,11 +4,7 @@ import pathlib
 import sys
 
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from whisper_backend.transcription_prompt import (  # noqa: E402
+from micwave_core.prompts import (  # noqa: E402
     TRANSCRIPTION_BIAS_PROMPT,
     transcription_prompt_for_model,
 )

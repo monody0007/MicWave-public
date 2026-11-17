@@ -18,14 +18,8 @@ These tests drive the real `_async_stop` on a lightweight core (built with
 """
 import asyncio
 import json
-import pathlib
-import sys
 
 import pytest
-
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 import ime_menubar
 from ime_menubar import BrainwaveIMECore, IMEState

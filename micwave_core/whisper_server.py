@@ -20,9 +20,11 @@ import collections
 import enum
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -31,12 +33,27 @@ import uvicorn
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketState
 
-from .audio_persistence import TurnAudioCache
+from .audio_persistence import WhisperTurnAudioCache as TurnAudioCache
 from .config import WHISPER_TRANSCRIBE_MODEL
 from .realtime_client_base import RealtimeClientBase
 from .realtime_text_utils import normalize_final_transcript
-from .transcript_merge import append_transcript_delta
-from .whisper_realtime_client import WhisperRealtimeTranscriptionClient
+from .transcript_merge import (
+    append_transcript_delta,
+    find_pathological_repetition,
+    join_whisper_segment_texts as join_segment_texts,
+)
+from .whisper_adapter import (
+    DEFAULT_SILENCE_RMS,
+    DEFAULT_SOFT_GRACE_SEC,
+    DEFAULT_SOFT_SEGMENT_SEC,
+    MAX_SEGMENT_SEC,
+    MAX_SILENCE_RMS,
+    QuietRunTracker,
+    SoftSegmentThresholds,
+    WhisperRealtimeTranscriptionClient,
+    load_into_environ,
+    resolve_soft_segment_thresholds,
+)
 
 logging.basicConfig(
     # DEBUG surfaces the audio-ingest path (buffer/send/late-frame) for probes and
@@ -54,14 +71,10 @@ logging.getLogger("websockets.client").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 VERBOSE_SERVER_LOG = os.getenv("WHISPERWAVE_VERBOSE_SERVER_LOG", "0") == "1"
 
-app = FastAPI()
-
-
-@app.get("/health")
 async def health_check():
     return {
         "status": "ok",
-        "backend": "whisper",
+        "backend": os.getenv("WHISPERWAVE_BACKEND_KEY", "whisper"),
         "contract": {"name": "echowave-pcm-websocket", "version": 1},
         "model": WHISPER_TRANSCRIBE_MODEL,
     }
@@ -124,11 +137,19 @@ class TranscriptionTurnSessionConfig:
     transcription_ack_grace_sec: float
     transcription_failure_rotate_threshold: int
     default_source_sample_rate: int
-    # Segment boundary (default 14400000 = 300s PCM16/24k). Reaching it commits
+    # Segment boundary (default 86400000 = 1800s PCM16/24k). Reaching it commits
     # the current segment instead of terminating the turn; the bound remains the
     # replay-memory guard. Env-overridable for very long single turns.
-    max_turn_audio_bytes: int = 14_400_000
+    max_turn_audio_bytes: int = 86_400_000
     force_reconnect_after_ms: int = 0
+    # Soft, silence-aligned segment boundary. A single long provider buffer made
+    # gpt-4o-transcribe answer the content instead of transcribing it (task
+    # 1049), so once the active segment holds `soft_segment_sec` of audio it is
+    # committed at the first >=300 ms low-energy window; with no pause by
+    # `soft + grace` it is committed at the current chunk boundary. 0 disables.
+    soft_segment_sec: float = DEFAULT_SOFT_SEGMENT_SEC
+    soft_segment_grace_sec: float = DEFAULT_SOFT_GRACE_SEC
+    soft_segment_silence_rms: float = DEFAULT_SILENCE_RMS
 
     @classmethod
     def from_env(cls) -> "TranscriptionTurnSessionConfig":
@@ -140,13 +161,26 @@ class TranscriptionTurnSessionConfig:
                 logger.warning("Invalid %s=%r, falling back to %s", name, raw, default)
                 return default
 
-        def float_env(name: str, default: float, minimum: float) -> float:
+        def float_env(
+            name: str, default: float, minimum: float, maximum: Optional[float] = None
+        ) -> float:
             raw = os.getenv(name, str(default))
             try:
-                return max(minimum, float(raw))
+                value = float(raw)
             except ValueError:
                 logger.warning("Invalid %s=%r, falling back to %s", name, raw, default)
                 return default
+            # `float()` also accepts nan/inf and overflows "1e309" to inf; those
+            # would break later int()/squaring, so they get the same fallback.
+            if not math.isfinite(value) or (maximum is not None and value > maximum):
+                logger.warning(
+                    "Out-of-range %s=%r (finite%s required), falling back to %s",
+                    name, raw,
+                    f", <= {maximum:g}" if maximum is not None else "",
+                    default,
+                )
+                return default
+            return max(minimum, value)
 
         return cls(
             keep_provider_session=os.getenv("WHISPERWAVE_KEEP_PROVIDER_SESSION", "1") == "1",
@@ -168,6 +202,18 @@ class TranscriptionTurnSessionConfig:
                 "WHISPERWAVE_MAX_TURN_AUDIO_BYTES", 86_400_000, 48_000
             ),
             force_reconnect_after_ms=int_env("WHISPERWAVE_FORCE_RECONNECT_AFTER_MS", 0, 0),
+            soft_segment_sec=float_env(
+                "WHISPERWAVE_SOFT_SEGMENT_SEC",
+                DEFAULT_SOFT_SEGMENT_SEC, 0.0, MAX_SEGMENT_SEC,
+            ),
+            soft_segment_grace_sec=float_env(
+                "WHISPERWAVE_SOFT_SEGMENT_GRACE_SEC",
+                DEFAULT_SOFT_GRACE_SEC, 0.0, MAX_SEGMENT_SEC,
+            ),
+            soft_segment_silence_rms=float_env(
+                "WHISPERWAVE_SOFT_SEGMENT_SILENCE_RMS",
+                DEFAULT_SILENCE_RMS, 1.0, MAX_SILENCE_RMS,
+            ),
         )
 
 
@@ -233,6 +279,10 @@ class TranscriptionTurnSession:
         self._provider_generation = 0
         self._commit_key: Optional[tuple[Optional[int], int, int]] = None
         self._finalize_commit_attempts = 0
+        # Bumped whenever `_finalize_commit_attempts` restarts at 0 (a new turn,
+        # or the next segment of this turn). The attempt number alone repeats
+        # across segments, so waiters identify progress by (epoch, attempt).
+        self._segment_epoch = 0
         # One append-before-send cache; replacements replay it from offset zero.
         # The byte counter covers successful sends to the current provider only.
         self._turn_audio_chunks: list[bytes] = []
@@ -248,7 +298,28 @@ class TranscriptionTurnSession:
         self._rollover_tail_chunks: list[bytes] = []
         self._rollover_tail_bytes = 0
         self._committed_transcript_text = ""
+        # True once a segment of this turn has ended without ending the turn
+        # (landed or retired as digital silence). Unlike the delivered text it
+        # survives a blank result, so a short final tail still counts as the
+        # end of a long turn.
+        self._had_prior_segment = False
         self._stop_requested = False
+        # Soft segment boundary: byte thresholds on the 24 kHz PCM16 stream and
+        # one trailing-quiet-run tracker per buffer (active segment / rollover
+        # tail). A tracker only observes bytes already admitted to its buffer.
+        bytes_per_sec = self._audio_processor.target_sample_rate * 2
+        thresholds = resolve_soft_segment_thresholds(
+            soft_sec=config.soft_segment_sec,
+            grace_sec=config.soft_segment_grace_sec,
+            rms_threshold=config.soft_segment_silence_rms,
+            bytes_per_sec=bytes_per_sec,
+            min_commit_bytes=self._MIN_COMMIT_AUDIO_BYTES,
+            hard_cap_bytes=config.max_turn_audio_bytes,
+        )
+        # None = soft boundary off: nothing else is computed, no tracker is built.
+        self._soft_thresholds: Optional[SoftSegmentThresholds] = thresholds
+        self._segment_quiet_tracker = self._new_quiet_tracker()
+        self._tail_quiet_tracker = self._new_quiet_tracker()
 
         # Item-identity state machine (H1): an item id moves tentative (a pre-ACK
         # delta may optimistically bind it so streaming is not delayed) →
@@ -270,6 +341,9 @@ class TranscriptionTurnSession:
         # must not append a replacement epoch's full text onto the old epoch.
         self._transcript_text = ""          # longest nonblank partial candidate
         self._provider_epoch_text = ""      # deltas from the current provider
+        self._seen_delta_event_ids: set[str] = set()
+        self._result_retry_pending = False
+        self._repetition_retry_started = False
         self._best_partial_text = ""         # best completed prior provider epoch
         self._provider_completed_text = ""  # raw authoritative provider final
         self._normalized_final_text = ""    # final-only local policy output
@@ -324,15 +398,17 @@ class TranscriptionTurnSession:
 
     @staticmethod
     def _select_completed_authority(completed: str, partial: str) -> str:
-        """Resolve finalize text defensively by keeping the longer nonblank view."""
+        """Use the item's nonblank final; an interim length is not authority."""
 
         trimmed_completed = completed.strip()
         trimmed_partial = partial.strip()
         if not trimmed_partial:
-            return trimmed_completed
+            return completed if trimmed_completed else ""
         if not trimmed_completed:
             return partial
-        return partial if len(trimmed_partial) >= len(trimmed_completed) else trimmed_completed
+        if trimmed_completed == trimmed_partial:
+            return partial  # Preserve already-emitted whitespace when equivalent.
+        return completed
 
     @staticmethod
     def _select_partial_candidate(current: str, previous: str) -> str:
@@ -387,6 +463,7 @@ class TranscriptionTurnSession:
         self._transport_state = TransportState.IDLE
         self._commit_key = None
         self._finalize_commit_attempts = 0
+        self._segment_epoch += 1
         self._turn_done = asyncio.Event()
         self._turn_audio_chunks = []
         self._turn_audio_bytes = 0
@@ -394,12 +471,18 @@ class TranscriptionTurnSession:
         self._segment_rollover_pending = False
         self._rollover_tail_chunks = []
         self._rollover_tail_bytes = 0
+        self._segment_quiet_tracker = self._new_quiet_tracker()
+        self._tail_quiet_tracker = self._new_quiet_tracker()
         self._committed_transcript_text = ""
+        self._had_prior_segment = False
         self._stop_requested = False
         self._current_item_id = None
         self._item_confirmed = False
         self._transcript_text = ""
         self._provider_epoch_text = ""
+        self._seen_delta_event_ids.clear()
+        self._result_retry_pending = False
+        self._repetition_retry_started = False
         self._best_partial_text = ""
         self._provider_completed_text = ""
         self._normalized_final_text = ""
@@ -653,6 +736,8 @@ class TranscriptionTurnSession:
             self._select_partial_candidate(prior_resolved, self._best_partial_text),
         )
         self._provider_epoch_text = ""
+        self._seen_delta_event_ids.clear()
+        self._result_retry_pending = False
         self._transcript_text = self._best_partial_text
         self._provider_completed_text = ""
         self._normalized_final_text = ""
@@ -680,6 +765,8 @@ class TranscriptionTurnSession:
             return False
         self._turn_audio_chunks.append(chunk)
         self._turn_audio_bytes = next_size
+        if self._segment_quiet_tracker is not None:
+            self._segment_quiet_tracker.feed(chunk)
         return True
 
     def _append_rollover_tail_locked(self, chunk: bytes) -> bool:
@@ -699,12 +786,22 @@ class TranscriptionTurnSession:
             return False
         self._rollover_tail_chunks.append(chunk)
         self._rollover_tail_bytes = next_size
+        if self._tail_quiet_tracker is not None:
+            self._tail_quiet_tracker.feed(chunk)
         return True
 
     def _aggregate_segment_text(self, segment_text: str) -> str:
         """Build the full client view from finalized prefix plus active segment."""
 
-        return append_transcript_delta(self._committed_transcript_text, segment_text)
+        return join_segment_texts(self._committed_transcript_text, segment_text)
+
+    def _new_quiet_tracker(self) -> Optional[QuietRunTracker]:
+        if self._soft_thresholds is None:
+            return None
+        return QuietRunTracker(
+            sample_rate=self._audio_processor.target_sample_rate,
+            rms_threshold=self._soft_thresholds.rms_threshold,
+        )
 
     def _reset_active_segment_state_locked(self) -> None:
         """Retire one completed item while keeping the surrounding client turn."""
@@ -717,6 +814,9 @@ class TranscriptionTurnSession:
         self._pending_terminals.clear()
         self._cancel_ack_grace_timer()
         self._provider_epoch_text = ""
+        self._seen_delta_event_ids.clear()
+        self._result_retry_pending = False
+        self._repetition_retry_started = False
         self._best_partial_text = ""
         self._transcript_text = ""
         self._provider_completed_text = ""
@@ -724,6 +824,7 @@ class TranscriptionTurnSession:
         self._transcript_completed = False
         self._commit_key = None
         self._finalize_commit_attempts = 0
+        self._segment_epoch += 1
 
     def _promote_rollover_tail_locked(self) -> None:
         """Make the buffered post-boundary tail the next replayable segment."""
@@ -734,6 +835,43 @@ class TranscriptionTurnSession:
         self._rollover_tail_chunks = []
         self._rollover_tail_bytes = 0
         self._provider_audio_bytes = 0
+        # The tail's quiet run carries over: its audio is now the active segment.
+        self._segment_quiet_tracker = self._tail_quiet_tracker
+        self._tail_quiet_tracker = self._new_quiet_tracker()
+
+    def _promote_next_segment_locked(self) -> None:
+        """Retire the landed (or empty) segment and make the queued tail current.
+
+        Shared by the two places a segment ends without ending the turn: the
+        completed-prefix coordinator and the digital-silence retire. Transport
+        state describes the provider buffer except for `_is_recording`, which
+        keeps following the user's stop.
+        """
+
+        self._assert_transport_locked()
+        self._reset_active_segment_state_locked()
+        self._had_prior_segment = True
+        self._promote_rollover_tail_locked()
+        self._segment_rollover_pending = False
+        self._openai_ready.clear()
+        if self._stop_requested:
+            self._transport_state = TransportState.STOP_REQUESTED
+            self._is_recording = False
+        else:
+            self._transport_state = TransportState.RECOVERING
+            self._is_recording = True
+
+    async def _rebuild_next_segment_locked(self, fail_reason: str) -> bool:
+        """Rebuild the provider for the promoted segment, or fail the rollover."""
+
+        self._assert_transport_locked()
+        recovered = await self._recover_transport_locked(
+            self._turn_generation,
+            planned_rollover=True,
+        )
+        if not recovered and not self._finalized:
+            await self._fail_segment_rollover_locked(fail_reason)
+        return recovered
 
     def _turn_is_digital_silence_locked(self) -> bool:
         """True only for nonempty PCM whose every byte is exactly zero.
@@ -747,6 +885,57 @@ class TranscriptionTurnSession:
         return self._turn_audio_bytes > 0 and not any(
             any(chunk) for chunk in self._turn_audio_chunks
         )
+
+    def _short_final_segment_is_committable_locked(self) -> bool:
+        """A nonempty, non-silent tail below the provider minimum that follows
+        an earlier segment of this turn (landed, blank, or retired as silence).
+
+        Dropping it would silently lose the end of the utterance, so it is
+        padded and committed instead of finishing with `insufficient_audio`.
+        The gate is "an earlier segment existed", not "text was delivered": a
+        blank-result or all-zero prefix still makes this the end of a long
+        turn. An empty tail, an all-zero tail, and a whole turn that is itself
+        too short (a tap, no earlier segment) keep the old early finish.
+        """
+
+        self._assert_transport_locked()
+        return (
+            0 < self._turn_audio_bytes < self._MIN_COMMIT_AUDIO_BYTES
+            and self._had_prior_segment
+            and not self._turn_is_digital_silence_locked()
+        )
+
+    async def _pad_short_final_segment_locked(self) -> bool:
+        """Extend the final segment with explicit digital silence to the
+        provider minimum without touching its original PCM.
+
+        The pad joins the replayable cache, so replay, resync and the
+        provider-sync byte accounting treat it like any other audio. It is sent
+        directly only when the provider already holds the whole original
+        segment; otherwise the next replay carries it. Returns False when that
+        direct send failed (the cache keeps the pad; the caller must resync).
+        The server-side persistent audio cache never sees the pad.
+        """
+
+        self._assert_transport_locked()
+        pad = bytes(self._MIN_COMMIT_AUDIO_BYTES - self._turn_audio_bytes)
+        synced = (
+            self._client is not None
+            and self._provider_audio_bytes == self._turn_audio_bytes
+        )
+        logger.info(
+            "Padding short final segment with digital silence "
+            "(turn=%s original_bytes=%d pad_bytes=%d provider_synced=%s)",
+            self._active_turn_id, self._turn_audio_bytes, len(pad), synced,
+        )
+        self._turn_audio_chunks.append(pad)
+        self._turn_audio_bytes += len(pad)
+        if not synced:
+            return True
+        if await self._send_provider_audio_locked(pad):
+            return True
+        self._mark_transport_sync_failed_locked()
+        return False
 
     async def _send_provider_audio_locked(self, chunk: bytes) -> bool:
         self._assert_transport_locked()
@@ -890,28 +1079,15 @@ class TranscriptionTurnSession:
             # empty segment and rebuild the crossing tail; ending the whole turn
             # here would discard speech that began exactly at the boundary.
             silent_bytes = self._turn_audio_bytes
-            self._reset_active_segment_state_locked()
-            self._promote_rollover_tail_locked()
-            self._openai_ready.clear()
-            if self._stop_requested:
-                self._transport_state = TransportState.STOP_REQUESTED
-                self._is_recording = False
-            else:
-                self._transport_state = TransportState.RECOVERING
-                self._is_recording = True
+            self._promote_next_segment_locked()
             logger.info(
                 "Retired digital-silence segment without ending turn "
                 "(turn=%s silent_bytes=%d next_bytes=%d)",
                 self._active_turn_id, silent_bytes, self._turn_audio_bytes,
             )
-            recovered = await self._recover_transport_locked(
-                self._turn_generation,
-                planned_rollover=True,
+            recovered = await self._rebuild_next_segment_locked(
+                "silent_segment_rollover_reconnect_exhausted"
             )
-            if not recovered and not self._finalized:
-                await self._fail_segment_rollover_locked(
-                    "silent_segment_rollover_reconnect_exhausted"
-                )
             self._segment_rollover_done.set()
             return recovered or self._finalized
         self._segment_rollover_pending = True
@@ -937,6 +1113,46 @@ class TranscriptionTurnSession:
                 "segment_rollover_commit_failed"
             )
         return False
+
+    def _soft_segment_boundary_reason_locked(self) -> Optional[str]:
+        """Why the active segment should roll over now, or None.
+
+        `silence`: the segment reached the soft target and its audio currently
+        ends in a >=300 ms low-energy run. `forced`: no such pause arrived by
+        soft target + grace. The 1800 s hard cap stays a separate byte fence.
+        """
+
+        self._assert_transport_locked()
+        tracker = self._segment_quiet_tracker
+        if (
+            tracker is None
+            or self._soft_thresholds is None
+            or self._segment_rollover_pending
+            or self._stop_requested
+            or not self._is_recording
+        ):
+            return None
+        return self._soft_thresholds.reason(
+            self._turn_audio_bytes, tracker.run_bytes
+        )
+
+    async def _maybe_begin_soft_segment_rollover_locked(self) -> bool:
+        """Reuse the planned rollover at a silence-aligned or forced boundary."""
+
+        reason = self._soft_segment_boundary_reason_locked()
+        if reason is None:
+            return False
+        bytes_per_sec = self._audio_processor.target_sample_rate * 2
+        logger.info(
+            "Soft segment boundary (turn=%s reason=%s segment_sec=%.2f "
+            "quiet_run_ms=%d rms_threshold=%.0f)",
+            self._active_turn_id, reason,
+            self._turn_audio_bytes / bytes_per_sec,
+            self._segment_quiet_tracker.run_bytes * 1000 // bytes_per_sec,
+            self._soft_thresholds.rms_threshold,
+        )
+        await self._begin_segment_rollover_locked()
+        return True
 
     def _arm_segment_rollover_timeout(self) -> None:
         task = self._segment_rollover_timeout_task
@@ -1120,6 +1336,7 @@ class TranscriptionTurnSession:
     def _discard_tentative_stream(self):
         """Drop content accumulated under a superseded tentative binding."""
         self._provider_epoch_text = ""
+        self._seen_delta_event_ids.clear()
         self._transcript_text = self._best_partial_text
         self._provider_completed_text = ""
         self._normalized_final_text = ""
@@ -1216,7 +1433,7 @@ class TranscriptionTurnSession:
         # turn. Fail-closed on a malformed (missing item_id) or retired ACK, and
         # never let a late ACK retire an already-confirmed current item — a
         # mismatched ACK may only supersede a still-*tentative* binding (N1).
-        if self._finalized or self._finalizing:
+        if self._finalized or self._finalizing or self._result_retry_pending:
             return
         ack_item = data.get("item_id")
         # Official schema: input_audio_buffer.committed carries item_id. A
@@ -1274,17 +1491,22 @@ class TranscriptionTurnSession:
     async def _on_transcription_delta(self, data):
         # Once finalize has begun, no further provider text may reach the client
         # (S1 / H2): drop late deltas rather than emitting text after idle.
-        if self._finalized or self._finalizing:
+        if self._finalized or self._finalizing or self._transcript_completed or self._result_retry_pending:
             return
         try:
             async with self._output_lock:
-                if self._finalized or self._finalizing:
+                if self._finalized or self._finalizing or self._transcript_completed or self._result_retry_pending:
                     return
                 if not self._match_item(data, "transcription.delta"):
                     return
                 delta = self._extract_delta(data)
                 if not delta:
                     return
+                event_id = data.get("event_id")
+                if isinstance(event_id, str) and event_id:
+                    if event_id in self._seen_delta_event_ids:
+                        return
+                    self._seen_delta_event_ids.add(event_id)
                 self._provider_epoch_text = append_transcript_delta(
                     self._provider_epoch_text, delta
                 )
@@ -1301,7 +1523,7 @@ class TranscriptionTurnSession:
         # foreign/stale/missing-id completed is dropped; a completed that raced
         # ahead of its own commit ACK is stashed pending (H1 residual) rather
         # than dropped, so the ACK can replay it instead of hanging to timeout.
-        if self._finalized or self._finalizing:
+        if self._finalized or self._finalizing or self._transcript_completed or self._result_retry_pending:
             return
         decision = self._classify_terminal(data, "transcription.completed")
         if decision == "drop":
@@ -1316,12 +1538,40 @@ class TranscriptionTurnSession:
         try:
             completed = self._extract_completed(data)
             self._consecutive_transcription_failures = 0
-            # Keep provider completed, streamed partial, and later W6 policy output
-            # separate; finalize defensively chooses the longer nonblank raw view.
+            # Keep final authority separate from provisional deltas. A corrected
+            # final may legitimately be shorter than a repeated interim view.
             self._provider_completed_text = completed
             raw_final = self._select_completed_authority(
                 completed, self._transcript_text
             )
+            source = "completed" if completed.strip() else "partial" if self._transcript_text.strip() else "empty"
+            logger.info(
+                "Transcription completed (raw_len=%d completed_len=%d partial_len=%d source=%s)",
+                len(raw_final), len(completed), len(self._transcript_text), source,
+            )
+            repetition = find_pathological_repetition(raw_final) if raw_final.strip() else None
+            if repetition is not None:
+                start, unit_chars, copies = repetition
+                logger.warning(
+                    "Suspect transcript repetition (source=%s start=%d unit_chars=%d copies=%d attempt=%d)",
+                    source, start, unit_chars, copies, self._finalize_commit_attempts,
+                )
+                # Reject this item's authority immediately, before the queued
+                # retry can run. Old callbacks cannot finalize or grow a fallback.
+                self._result_retry_pending = True
+                self._repetition_retry_started = True
+                self._retire_item(self._current_item_id)
+                self._provider_completed_text = ""
+                self._provider_epoch_text = ""
+                self._transcript_text = ""
+                self._best_partial_text = ""
+                self._normalized_final_text = ""
+                self._transcript_completed = False
+                if self._can_retry_finalize_result():
+                    self._schedule_finalize_retry("repeated_transcript")
+                else:
+                    self._schedule_finalize("repeated_transcript")
+                return
             if not completed.strip() and self._transcript_text.strip():
                 logger.info(
                     "Blank completed; retaining nonblank streamed partial (len=%d)",
@@ -1337,7 +1587,6 @@ class TranscriptionTurnSession:
                 self._schedule_finalize_retry("empty_transcript")
                 return
             self._transcript_completed = True
-            logger.info("Transcription completed (raw_len=%d)", len(raw_final))
         except Exception as e:
             logger.error("Error in transcription completed handler: %s", e, exc_info=True)
         # A memory-boundary commit finalizes only this segment. The surrounding
@@ -1387,16 +1636,7 @@ class TranscriptionTurnSession:
 
                 completed_item = self._current_item_id
                 completed_bytes = self._turn_audio_bytes
-                self._reset_active_segment_state_locked()
-                self._promote_rollover_tail_locked()
-                self._segment_rollover_pending = False
-                self._openai_ready.clear()
-                if self._stop_requested:
-                    self._transport_state = TransportState.STOP_REQUESTED
-                    self._is_recording = False
-                else:
-                    self._transport_state = TransportState.RECOVERING
-                    self._is_recording = True
+                self._promote_next_segment_locked()
 
                 logger.info(
                     "Segment finalized without ending turn "
@@ -1406,14 +1646,9 @@ class TranscriptionTurnSession:
                     self._turn_audio_bytes, len(self._committed_transcript_text),
                     self._stop_requested,
                 )
-                recovered = await self._recover_transport_locked(
-                    self._turn_generation,
-                    planned_rollover=True,
+                await self._rebuild_next_segment_locked(
+                    "segment_rollover_reconnect_exhausted"
                 )
-                if not recovered and not self._finalized:
-                    await self._fail_segment_rollover_locked(
-                        "segment_rollover_reconnect_exhausted"
-                    )
                 self._segment_rollover_done.set()
         except asyncio.CancelledError:
             raise
@@ -1428,7 +1663,7 @@ class TranscriptionTurnSession:
                 self._segment_rollover_task = None
 
     async def _on_transcription_failed(self, data):
-        if self._finalized or self._finalizing:
+        if self._finalized or self._finalizing or self._result_retry_pending:
             return
         decision = self._classify_terminal(data, "transcription.failed")
         if decision == "drop":
@@ -1461,6 +1696,8 @@ class TranscriptionTurnSession:
         provider_client: Optional[RealtimeClientBase] = None,
         turn_generation: Optional[int] = None,
     ):
+        if self._result_retry_pending:
+            return  # The rejected provider item is already owned by its retry.
         error_info = data.get("error", {}) if isinstance(data, dict) else {}
         error_msg = error_info.get("message", "Unknown error")
         in_finalize = self._finalizing or self._transport_state in {
@@ -1481,7 +1718,7 @@ class TranscriptionTurnSession:
         if self._active_turn_id is not None:
             payload["turn_id"] = self._active_turn_id
         async with self._transport_lock:
-            if self._finalized or self._finalizing:
+            if self._finalized or self._finalizing or self._result_retry_pending:
                 logger.info("Ignoring provider error after finalize barrier started")
                 return
             if not self._provider_event_is_current(
@@ -1593,6 +1830,9 @@ class TranscriptionTurnSession:
         if not self._segment_rollover_pending:
             self._is_recording = False
         self._openai_ready.clear()
+        if reason == "repeated_transcript":
+            await self._reset_client_display()
+            self._emitted_text = self._committed_transcript_text
         return await self._recover_transport_locked(self._turn_generation)
 
     def _schedule_finalize(self, reason: str):
@@ -1754,9 +1994,37 @@ class TranscriptionTurnSession:
         done = self._turn_done
         if self._finalized:
             return
+        candidate = self._select_completed_authority(
+            self._provider_completed_text, self._transcript_text
+        ) if self._transcript_completed else self._transcript_text
+        if find_pathological_repetition(candidate) is not None:
+            # Failed/timeout/disconnect exits also select partial fallbacks.
+            # Never let an uncompleted looping candidate bypass the error path.
+            self._repetition_retry_started = True
+            self._result_retry_pending = True
+            self._transcript_completed = False
+            self._provider_completed_text = ""
+            self._provider_epoch_text = ""
+            self._transcript_text = ""
+            self._best_partial_text = ""
+            self._normalized_final_text = ""
+            reason = "repeated_transcript"
         # Latch before any awaited replacement/reconciliation so provider text
         # handlers cannot pass their entry guard and land after idle (S1).
         self._finalizing = True
+        if self._repetition_retry_started and reason not in self._SUCCESSFUL_FINALIZE_REASONS:
+            payload = {
+                "type": "error",
+                "content": "转写结果出现大量重复，重试后仍未恢复。本次未自动粘贴。",
+                "terminal": True,
+                "reason": "repeated_transcript",
+            }
+            if self._active_turn_id is not None:
+                payload["turn_id"] = self._active_turn_id
+            try:
+                await self._websocket.send_text(json.dumps(payload, ensure_ascii=False))
+            except Exception as exc:
+                logger.error("Failed to send terminal repetition error (%s)", type(exc).__name__)
         reason = await self._seal_client_output_locked(reason)
         # Single finalize barrier for every exit path (completed / failed /
         # timeout / commit error / provider error / disconnect): the output
@@ -1829,10 +2097,11 @@ class TranscriptionTurnSession:
 
     # ── provider session lifecycle ───────────────────────────────────────────
     async def _create_client(self) -> RealtimeClientBase:
-        if not OPENAI_API_KEY:
+        api_key = OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
+        if not api_key:
             raise ValueError("OPENAI_API_KEY not set in environment variables")
         logger.info("Creating transcription client (model: %s)", WHISPER_TRANSCRIBE_MODEL)
-        return WhisperRealtimeTranscriptionClient(OPENAI_API_KEY)
+        return WhisperRealtimeTranscriptionClient(api_key)
 
     async def _init_or_reuse_client(
         self,
@@ -1962,6 +2231,9 @@ class TranscriptionTurnSession:
         self._assert_transport_locked()
         if self._finalized:
             return
+        if self._repetition_retry_started:
+            await self._finalize_turn_locked(reason)
+            return
         payload = {
             "type": "error",
             "content": "Transcription segment recovery failed",
@@ -2046,8 +2318,11 @@ class TranscriptionTurnSession:
 
             if self._transport_state == TransportState.STOP_REQUESTED:
                 if self._turn_audio_bytes < self._MIN_COMMIT_AUDIO_BYTES:
-                    await self._finalize_turn_locked("insufficient_audio")
-                    return True
+                    if not self._short_final_segment_is_committable_locked():
+                        await self._finalize_turn_locked("insufficient_audio")
+                        return True
+                    if not await self._pad_short_final_segment_locked():
+                        continue  # next attempt replays the padded segment
                 if self._turn_is_digital_silence_locked():
                     await self._finalize_turn_locked("digital_silence")
                     return True
@@ -2069,6 +2344,8 @@ class TranscriptionTurnSession:
         async with self._transport_lock:
             if self._finalized:
                 return
+            if self._result_retry_pending:
+                return  # The scheduled retry already rebuilds this provider.
             # A callback can queue behind a direct send/finalize recovery. Check
             # its epoch only after acquiring the sole transport owner so an old
             # generation cannot close and replace the new one (ABA).
@@ -2264,11 +2541,18 @@ class TranscriptionTurnSession:
             )
             async with self._transport_lock:
                 if self._commit_key != self._current_commit_key() and not self._finalized:
-                    if self._turn_audio_bytes < self._MIN_COMMIT_AUDIO_BYTES:
+                    if (
+                        self._turn_audio_bytes < self._MIN_COMMIT_AUDIO_BYTES
+                        and not self._short_final_segment_is_committable_locked()
+                    ):
                         await self._finalize_turn_locked("insufficient_audio")
                     elif self._turn_is_digital_silence_locked():
                         await self._finalize_turn_locked("digital_silence")
                     else:
+                        if self._turn_audio_bytes < self._MIN_COMMIT_AUDIO_BYTES:
+                            # Committable short continuation: pad, then the
+                            # usual resync/commit below sees a full segment.
+                            await self._pad_short_final_segment_locked()
                         needs_resync = (
                             self._client is None
                             or not self._client._is_ws_open()
@@ -2294,7 +2578,10 @@ class TranscriptionTurnSession:
                                     await self._finalize_turn_locked("provider_unavailable")
 
         while not self._finalized and not done_event.is_set():
-            waited_attempt = self._finalize_commit_attempts
+            # The attempt number restarts for every segment, so progress is the
+            # (segment epoch, attempt) pair: a promotion during this wait hands
+            # the final segment its own full window and retry budget.
+            waited = (self._segment_epoch, self._finalize_commit_attempts)
             try:
                 await asyncio.wait_for(
                     done_event.wait(),
@@ -2304,14 +2591,16 @@ class TranscriptionTurnSession:
                 logger.error(
                     "Transcription timed out after %.1fs (finalize_attempt=%d/%d)",
                     self._config.transcription_finalize_timeout_sec,
-                    waited_attempt, self._FINALIZE_MAX_ATTEMPTS,
+                    waited[1], self._FINALIZE_MAX_ATTEMPTS,
                 )
                 async with self._transport_lock:
                     if self._finalized or done_event.is_set():
                         return
-                    # Another duplicate stop may already have advanced the
-                    # provider attempt while this waiter timed out.
-                    if self._finalize_commit_attempts != waited_attempt:
+                    # A duplicate stop may have advanced the provider attempt, or
+                    # a rollover may have promoted the next segment, while this
+                    # waiter timed out: either way the current attempt has not
+                    # had its own window yet.
+                    if (self._segment_epoch, self._finalize_commit_attempts) != waited:
                         continue
                     if await self._retry_finalize_result_locked("timeout"):
                         continue
@@ -2406,6 +2695,10 @@ class TranscriptionTurnSession:
                             and turn_generation == self._turn_generation
                         ):
                             await self._finalize_turn_locked("reconnect_exhausted")
+                        return
+                    # The chunk is in the provider buffer: a boundary decided
+                    # here falls between whole chunks, so no audio is split.
+                    await self._maybe_begin_soft_segment_rollover_locked()
                     return
 
             if rollover_done is not None:
@@ -2555,8 +2848,6 @@ class TranscriptionTurnSession:
         logger.info("WebSocket connection closed for /api/v1/ws")
 
 
-@app.websocket("/ws")
-@app.websocket("/api/v1/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     config = TranscriptionTurnSessionConfig.from_env()
@@ -2567,8 +2858,40 @@ async def websocket_endpoint(websocket: WebSocket):
         await session.close()
 
 
-if __name__ == '__main__':
-    # Default 23459 preserves the production port; WHISPERWAVE_PORT lets a probe /
-    # test run an isolated instance (e.g. 23465) without colliding with the live app.
+def create_whisper_realtime_app() -> FastAPI:
+    """Create a FastAPI WhisperWave realtime transcription application."""
+    whisper_app = FastAPI()
+    whisper_app.add_api_route("/health", health_check, methods=["GET"])
+    for ws_path in ("/ws", "/api/v1/ws", "/ws/realtime"):
+        whisper_app.add_api_websocket_route(ws_path, websocket_endpoint)
+    return whisper_app
+
+
+app = create_whisper_realtime_app()
+
+
+def main() -> None:
+    config_path = Path(
+        os.getenv(
+            "ECHOWAVE_WHISPER_CONFIG_FILE",
+            str(
+                Path.home()
+                / "Library"
+                / "Application Support"
+                / "EchoWave"
+                / "whisper"
+                / "backend.env"
+            ),
+        )
+    ).expanduser()
+    load_into_environ(config_path, override=False)
+    global OPENAI_API_KEY
+    if not OPENAI_API_KEY:
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     port = int(os.getenv("WHISPERWAVE_PORT", "23459"))
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    host = os.getenv("WHISPERWAVE_HOST", "127.0.0.1")
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == '__main__':
+    main()

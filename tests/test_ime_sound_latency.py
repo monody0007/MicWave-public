@@ -1,16 +1,10 @@
 """Immediate IME sound cues without an audio device or a running sound process."""
 import asyncio
-import pathlib
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 import ime_menubar
 from ime_menubar import BrainwaveIMECore, Config, IMEState, RecordingMode

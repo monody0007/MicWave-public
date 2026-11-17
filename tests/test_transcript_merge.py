@@ -1,11 +1,8 @@
 import pathlib
 import sys
 
-PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-from transcript_merge import merge_incremental_text
+from micwave_core.transcript_merge import merge_incremental_text
 
 
 def test_merge_with_empty_values():
